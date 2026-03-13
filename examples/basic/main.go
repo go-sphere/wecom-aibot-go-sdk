@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	aibot2 "github.com/go-sphere/wecom-aibot-go-sdk/aibot"
+	"github.com/go-sphere/wecom-aibot-go-sdk/aibot"
 )
 
 func main() {
@@ -26,7 +26,7 @@ func main() {
 	fmt.Println("Bot ID:", botID)
 
 	// 创建客户端
-	client := aibot2.NewWSClient(aibot2.WSClientOptions{
+	client := aibot.NewWSClient(aibot.WSClientOptions{
 		BotID:  botID,
 		Secret: botSecret,
 		WSURL:  "",  // 使用默认地址
@@ -55,17 +55,17 @@ func main() {
 	})
 
 	// 消息处理
-	client.OnMessage(func(frame *aibot2.WsFrame) {
-		msgType := aibot2.GetMsgType(frame)
+	client.OnMessage(func(frame *aibot.WsFrame) {
+		msgType := aibot.GetMsgType(frame)
 		fmt.Printf("📩 收到消息: %s\n", msgType)
 	})
 
-	client.OnMessageText(func(frame *aibot2.WsFrame) {
+	client.OnMessageText(func(frame *aibot.WsFrame) {
 		fmt.Println("📝 收到文本消息")
 
 		// 解析消息体
-		var msg aibot2.TextMessage
-		if err := aibot2.ParseMessageBody(frame, &msg); err != nil {
+		var msg aibot.TextMessage
+		if err := aibot.ParseMessageBody(frame, &msg); err != nil {
 			fmt.Println("解析消息失败:", err.Error())
 			return
 		}
@@ -79,12 +79,12 @@ func main() {
 		_, _ = client.ReplyStream(frame, streamID, reply, true, nil, nil)
 	})
 
-	client.OnMessageImage(func(frame *aibot2.WsFrame) {
+	client.OnMessageImage(func(frame *aibot.WsFrame) {
 		fmt.Println("🖼️ 收到图片消息")
 
 		// 解析消息体
-		var msg aibot2.ImageMessage
-		if err := aibot2.ParseMessageBody(frame, &msg); err != nil {
+		var msg aibot.ImageMessage
+		if err := aibot.ParseMessageBody(frame, &msg); err != nil {
 			fmt.Println("解析消息失败:", err.Error())
 			return
 		}
@@ -115,12 +115,12 @@ func main() {
 		}
 	})
 
-	client.OnMessageFile(func(frame *aibot2.WsFrame) {
+	client.OnMessageFile(func(frame *aibot.WsFrame) {
 		fmt.Println("📎 收到文件消息")
 
 		// 解析消息体
-		var msg aibot2.FileMessage
-		if err := aibot2.ParseMessageBody(frame, &msg); err != nil {
+		var msg aibot.FileMessage
+		if err := aibot.ParseMessageBody(frame, &msg); err != nil {
 			fmt.Println("解析消息失败:", err.Error())
 			return
 		}
@@ -149,17 +149,17 @@ func main() {
 	})
 
 	// 事件处理
-	client.OnEvent(func(frame *aibot2.WsFrame) {
-		eventType := aibot2.GetEventType(frame)
+	client.OnEvent(func(frame *aibot.WsFrame) {
+		eventType := aibot.GetEventType(frame)
 		fmt.Printf("📋 收到事件: %s\n", eventType)
 	})
 
-	client.OnEventEnterChat(func(frame *aibot2.WsFrame) {
+	client.OnEventEnterChat(func(frame *aibot.WsFrame) {
 		fmt.Println("👋 用户进入会话")
 
 		// 解析消息体
-		var eventMsg aibot2.EventMessage
-		if err := aibot2.ParseMessageBody(frame, &eventMsg); err != nil {
+		var eventMsg aibot.EventMessage
+		if err := aibot.ParseMessageBody(frame, &eventMsg); err != nil {
 			fmt.Println("解析事件失败:", err.Error())
 			return
 		}
@@ -167,22 +167,22 @@ func main() {
 		fmt.Printf("  用户: %s\n", eventMsg.From.UserID)
 
 		// 发送欢迎语
-		welcomeBody := aibot2.CreateTextReplyBody("你好！有什么可以帮助你的吗？")
+		welcomeBody := aibot.CreateTextReplyBody("你好！有什么可以帮助你的吗？")
 		_, _ = client.ReplyWelcome(frame, welcomeBody)
 	})
 
-	client.OnEventTemplateCardEvent(func(frame *aibot2.WsFrame) {
+	client.OnEventTemplateCardEvent(func(frame *aibot.WsFrame) {
 		fmt.Println("📋 用户点击模板卡片")
 
 		// 解析消息体
-		var eventMsg aibot2.EventMessage
-		if err := aibot2.ParseMessageBody(frame, &eventMsg); err != nil {
+		var eventMsg aibot.EventMessage
+		if err := aibot.ParseMessageBody(frame, &eventMsg); err != nil {
 			fmt.Println("解析事件失败:", err.Error())
 			return
 		}
 
 		// 解析事件数据
-		var eventData aibot2.TemplateCardEventData
+		var eventData aibot.TemplateCardEventData
 		if err := json.Unmarshal(eventMsg.Event, &eventData); err != nil {
 			fmt.Println("解析事件数据失败:", err.Error())
 			return
