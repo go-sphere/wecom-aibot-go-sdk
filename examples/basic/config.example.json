@@ -1,0 +1,9 @@
+{
+  "bot_id": "your-bot-id",
+  "bot_secret": "your-bot-secret",
+  "anthropic_api_key": "your-anthropic-api-key",
+  "anthropic_base_url": "",
+  "model": "claude-sonnet-4-6",
+  "system_prompt": "你是一个企业微信AI助手，请用中文回答问题。",
+  "max_tokens": 4096
+}
