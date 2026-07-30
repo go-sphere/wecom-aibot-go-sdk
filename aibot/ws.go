@@ -82,6 +82,12 @@ type WsConnectionManager struct {
 	ws            *websocket.Conn
 	isManualClose bool
 
+	// writeMu 串行化对 ws 的写操作。gorilla/websocket 只允许一个并发写者，
+	// 否则直接 panic("concurrent write to websocket connection")。本管理器有
+	// 多个独立写入方：每个 reqID 各起一个 processReplyQueue goroutine，以及
+	// 心跳定时器，因此必须加锁。锁只覆盖写调用本身，不覆盖回执等待。
+	writeMu sync.Mutex
+
 	// 认证凭证
 	botID           string
 	botSecret       string
@@ -579,7 +585,10 @@ func (m *WsConnectionManager) sendFrame(frame WsFrame) {
 		return
 	}
 
-	if err := m.ws.WriteMessage(websocket.TextMessage, data); err != nil {
+	m.writeMu.Lock()
+	err = m.ws.WriteMessage(websocket.TextMessage, data)
+	m.writeMu.Unlock()
+	if err != nil {
 		m.logger.Error("Failed to send frame: " + err.Error())
 	}
 }
@@ -595,6 +604,8 @@ func (m *WsConnectionManager) Send(frame WsFrame) error {
 		return err
 	}
 
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
 	return m.ws.WriteMessage(websocket.TextMessage, data)
 }
 
