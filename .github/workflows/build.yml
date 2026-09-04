@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version-file: examples/basic/go.mod
           cache-dependency-path: "**/go.sum"
       - name: Test
         run: make test
