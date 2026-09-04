@@ -71,7 +71,7 @@ func TestWecomCrypto_ComputeSignature(t *testing.T) {
 	}
 
 	for _, c := range sig {
-		if !((c >= 'a' && c <= 'f') || (c >= '0' && c <= '9')) {
+		if (c < 'a' || c > 'f') && (c < '0' || c > '9') {
 			t.Fatalf("Invalid hex character in signature: %c", c)
 		}
 	}

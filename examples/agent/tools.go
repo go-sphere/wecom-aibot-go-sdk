@@ -226,7 +226,7 @@ func (te *ToolExecutor) bash(ctx context.Context, raw json.RawMessage) (string, 
 		if result.Len() > 0 {
 			result.WriteString("\n")
 		}
-		result.WriteString(fmt.Sprintf("[exit error] %v", err))
+		fmt.Fprintf(&result, "[exit error] %v", err)
 		return result.String(), true
 	}
 	if result.Len() == 0 {

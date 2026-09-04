@@ -641,7 +641,7 @@ func (c *WSClient) UploadMedia(fileBuffer []byte, options UploadMediaOptions) (*
 	c.logger.Info("Upload init success: upload_id=" + initResp.UploadID)
 
 	// Step 2: 分片上传（串行，避免并发问题）
-	for i := 0; i < totalChunks; i++ {
+	for i := range totalChunks {
 		start := i * chunkSize
 		end := start + chunkSize
 		if end > totalSize {
@@ -667,9 +667,7 @@ func (c *WSClient) UploadMedia(fileBuffer []byte, options UploadMediaOptions) (*
 
 	// Step 3: 完成上传
 	finishReqID := GenerateReqId(WsCmd.UPLOAD_MEDIA_FINISH)
-	finishResult, err := c.wsManager.SendReply(finishReqID, UploadMediaFinishBody{
-		UploadID: initResp.UploadID,
-	}, WsCmd.UPLOAD_MEDIA_FINISH)
+	finishResult, err := c.wsManager.SendReply(finishReqID, UploadMediaFinishBody(initResp), WsCmd.UPLOAD_MEDIA_FINISH)
 	if err != nil {
 		return nil, fmt.Errorf("upload finish failed: %w", err)
 	}

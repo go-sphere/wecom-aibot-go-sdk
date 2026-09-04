@@ -80,10 +80,10 @@ func PKCS7Unpad(data []byte, blockSize int) ([]byte, error) {
 // 独立于 Webhook、WebSocket、Agent 的具体协议形态，统一提供基于 AES-256-CBC
 // 的加解密与 SHA1 签名计算能力。
 type WecomCrypto struct {
-	token      string
-	aesKey     []byte
-	iv         []byte
-	receiveID  string
+	token     string
+	aesKey    []byte
+	iv        []byte
+	receiveID string
 }
 
 // NewWecomCrypto 创建 WecomCrypto 实例
