@@ -419,7 +419,7 @@ type UploadMediaFinishBody struct {
 type UploadMediaFinishResult struct {
 	Type      WeComMediaType `json:"type"`
 	MediaID   string         `json:"media_id"`
-	CreatedAt string         `json:"created_at"`
+	CreatedAt interface{}    `json:"created_at"`
 }
 
 // ============================================================================
