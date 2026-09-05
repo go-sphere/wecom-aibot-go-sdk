@@ -248,6 +248,10 @@ func (m *WsConnectionManager) setupEventHandlers() {
 			default:
 			}
 
+			if m.ws == nil {
+				return
+			}
+
 			_, data, err := m.ws.ReadMessage()
 			if err != nil {
 				if m.isManualClose {
@@ -304,10 +308,9 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 			if m.OnServerDisconnect != nil {
 				m.OnServerDisconnect("New connection established, server disconnected this connection")
 			}
-			// 主动关闭 socket
+			// 主动关闭 socket（不置 nil，让读协程在 ReadMessage 返回错误后通过 isManualClose 检查优雅退出）
 			if m.ws != nil {
 				_ = m.ws.Close()
-				m.ws = nil
 			}
 			return
 		}
