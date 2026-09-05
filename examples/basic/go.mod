@@ -1,6 +1,6 @@
 module github.com/go-sphere/wecom-aibot-go-sdk/aibot/example/basic
 
-go 1.26.1
+go 1.26.8
 
 replace github.com/go-sphere/wecom-aibot-go-sdk => ../..
 
