@@ -3,6 +3,8 @@ package aibot
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/gorilla/websocket"
 )
@@ -419,7 +421,34 @@ type UploadMediaFinishBody struct {
 type UploadMediaFinishResult struct {
 	Type      WeComMediaType `json:"type"`
 	MediaID   string         `json:"media_id"`
-	CreatedAt interface{}    `json:"created_at"`
+	CreatedAt WeComTimestamp `json:"created_at"`
+}
+
+// WeComTimestamp 企微接口返回的秒级时间戳。
+//
+// 企微返回的时间戳字段通常为数字（如 1767240000），但个别接口场景会以字符串形式
+// （如 "1767240000"）返回。该类型在反序列化时同时兼容两种格式，序列化时统一输出数字，
+// 可通过 int64 转换直接使用：int64(t)。
+type WeComTimestamp int64
+
+// UnmarshalJSON 兼容数字与字符串两种形式的秒级时间戳
+func (t *WeComTimestamp) UnmarshalJSON(data []byte) error {
+	text := strings.TrimSpace(string(data))
+	if text == "null" || text == `""` {
+		*t = 0
+		return nil
+	}
+	if v, err := strconv.ParseInt(text, 10, 64); err == nil {
+		*t = WeComTimestamp(v)
+		return nil
+	}
+	if len(text) >= 2 && text[0] == '"' && text[len(text)-1] == '"' {
+		if v, err := strconv.ParseInt(text[1:len(text)-1], 10, 64); err == nil {
+			*t = WeComTimestamp(v)
+			return nil
+		}
+	}
+	return fmt.Errorf("wecom timestamp: cannot parse %s", text)
 }
 
 // ============================================================================

@@ -79,7 +79,9 @@ type WsConnectionManager struct {
 	maxAuthFailureAttempts int
 	maxReplyQueueSize      int
 
-	ws            *websocket.Conn
+	wsMu sync.RWMutex // 保护 ws 字段的并发读写
+	ws   *websocket.Conn
+
 	isManualClose bool
 
 	// 认证凭证
@@ -194,10 +196,7 @@ func (m *WsConnectionManager) Connect() {
 	}
 
 	// 清理可能未完全关闭的旧连接
-	if m.ws != nil {
-		_ = m.ws.Close()
-		m.ws = nil
-	}
+	m.closeConn()
 
 	m.logger.Info("Connecting to WebSocket: %s...", m.wsURL)
 
@@ -220,7 +219,7 @@ func (m *WsConnectionManager) connect() {
 		return
 	}
 
-	m.ws = ws
+	m.setConn(ws)
 	m.missedPongCount = 0
 	m.lastCloseWasAuthFailure = false
 	m.setupEventHandlers()
@@ -235,11 +234,15 @@ func (m *WsConnectionManager) connect() {
 
 // setupEventHandlers 设置事件处理器
 func (m *WsConnectionManager) setupEventHandlers() {
-	if m.ws == nil {
+	conn := m.getConn()
+	if conn == nil {
 		return
 	}
 
-	// 读取消息
+	// 读取消息。
+	// 注意：每次建连都会启动一个新的读协程，因此这里持有本次连接的局部引用 conn，
+	// 而不是循环内反复读 m.ws —— m.ws 可能被 Disconnect/Connect/断线清理置 nil 或替换，
+	// 循环内读取会造成对已关闭连接甚至 nil 的解引用。
 	go func() {
 		for {
 			select {
@@ -248,11 +251,7 @@ func (m *WsConnectionManager) setupEventHandlers() {
 			default:
 			}
 
-			if m.ws == nil {
-				return
-			}
-
-			_, data, err := m.ws.ReadMessage()
+			_, data, err := conn.ReadMessage()
 			if err != nil {
 				if m.isManualClose {
 					return
@@ -308,10 +307,10 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 			if m.OnServerDisconnect != nil {
 				m.OnServerDisconnect("New connection established, server disconnected this connection")
 			}
-			// 主动关闭 socket（不置 nil，让读协程在 ReadMessage 返回错误后通过 isManualClose 检查优雅退出）
-			if m.ws != nil {
-				_ = m.ws.Close()
-			}
+			// 主动关闭 socket 并清空连接引用。
+			// 读协程持有的是本连接的局部引用，不受 m.ws 置 nil 影响，
+			// Close 后 ReadMessage 返回错误，读协程通过 isManualClose 检查优雅退出。
+			m.closeConn()
 			return
 		}
 
@@ -376,9 +375,7 @@ func (m *WsConnectionManager) handleAuthResponse(frame *WsFrame) {
 		// 标记为认证失败，close 事件中 scheduleReconnect 会据此使用 authFailureAttempts 计数器
 		m.lastCloseWasAuthFailure = true
 		// 认证失败，主动关闭连接，触发 close → handleClose → scheduleReconnect
-		if m.ws != nil {
-			_ = m.ws.Close()
-		}
+		m.closeConn()
 		return
 	}
 
@@ -408,7 +405,7 @@ func (m *WsConnectionManager) handleClose(reason string) {
 	m.clearPendingMessages("WebSocket connection closed (" + reason + ")")
 
 	// 释放旧 WebSocket 实例引用
-	m.ws = nil
+	m.setConn(nil)
 
 	if m.OnDisconnected != nil {
 		m.OnDisconnected(reason)
@@ -421,7 +418,8 @@ func (m *WsConnectionManager) handleClose(reason string) {
 
 // sendAuth 发送认证帧
 func (m *WsConnectionManager) sendAuth() {
-	if m.ws == nil {
+	conn := m.getConn()
+	if conn == nil {
 		return
 	}
 
@@ -459,9 +457,7 @@ func (m *WsConnectionManager) sendHeartbeat() {
 	if m.missedPongCount >= maxMissedPong {
 		m.logger.Warn("No heartbeat ack received for %d consecutive pings, connection considered dead", m.missedPongCount)
 		m.stopHeartbeat()
-		if m.ws != nil {
-			_ = m.ws.Close()
-		}
+		m.closeConn()
 		return
 	}
 
@@ -572,7 +568,8 @@ func (m *WsConnectionManager) scheduleReconnect() {
 
 // sendFrame 发送帧
 func (m *WsConnectionManager) sendFrame(frame WsFrame) {
-	if m.ws == nil {
+	conn := m.getConn()
+	if conn == nil {
 		return
 	}
 
@@ -582,14 +579,15 @@ func (m *WsConnectionManager) sendFrame(frame WsFrame) {
 		return
 	}
 
-	if err := m.ws.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		m.logger.Error("Failed to send frame: %s", err.Error())
 	}
 }
 
 // Send 发送数据帧
 func (m *WsConnectionManager) Send(frame WsFrame) error {
-	if m.ws == nil {
+	conn := m.getConn()
+	if conn == nil {
 		return fmt.Errorf("WebSocket not connected, unable to send data")
 	}
 
@@ -598,7 +596,7 @@ func (m *WsConnectionManager) Send(frame WsFrame) error {
 		return err
 	}
 
-	return m.ws.WriteMessage(websocket.TextMessage, data)
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // SendReply 通过 WebSocket 通道发送回复消息
@@ -858,15 +856,38 @@ func (m *WsConnectionManager) Disconnect() {
 		m.reconnectTimer = nil
 	}
 
-	if m.ws != nil {
-		_ = m.ws.Close()
-		m.ws = nil
-	}
+	m.closeConn()
 
 	m.logger.Info("WebSocket connection manually closed")
 }
 
+// getConn 原子地返回当前连接快照（可能为 nil）
+func (m *WsConnectionManager) getConn() *websocket.Conn {
+	m.wsMu.RLock()
+	defer m.wsMu.RUnlock()
+	return m.ws
+}
+
+// setConn 原子地设置当前连接
+func (m *WsConnectionManager) setConn(conn *websocket.Conn) {
+	m.wsMu.Lock()
+	m.ws = conn
+	m.wsMu.Unlock()
+}
+
+// closeConn 原子地关闭并清空当前连接
+func (m *WsConnectionManager) closeConn() {
+	m.wsMu.Lock()
+	if m.ws != nil {
+		_ = m.ws.Close()
+		m.ws = nil
+	}
+	m.wsMu.Unlock()
+}
+
 // IsConnected 获取当前连接状态
 func (m *WsConnectionManager) IsConnected() bool {
+	m.wsMu.RLock()
+	defer m.wsMu.RUnlock()
 	return m.ws != nil
 }
