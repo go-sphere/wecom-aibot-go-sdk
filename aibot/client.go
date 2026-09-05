@@ -173,7 +173,7 @@ func (c *WSClient) setupWsEvents() {
 
 	// 服务端因新连接建立而主动断开旧连接
 	c.wsManager.OnServerDisconnect = func(reason string) {
-		c.logger.Warn("Server disconnected this connection: " + reason)
+		c.logger.Warn("Server disconnected this connection: %s", reason)
 		c.mu.Lock()
 		c.started = false
 		c.mu.Unlock()
@@ -615,7 +615,7 @@ func (c *WSClient) UploadMedia(fileBuffer []byte, options UploadMediaOptions) (*
 	// 计算文件 MD5
 	md5Hash := md5Sum(fileBuffer)
 
-	c.logger.Info(fmt.Sprintf("Uploading media: type=%s, filename=%s, size=%d, chunks=%d", options.Type, options.Filename, totalSize, totalChunks))
+	c.logger.Info("Uploading media: type=%s, filename=%s, size=%d, chunks=%d", options.Type, options.Filename, totalSize, totalChunks)
 
 	// Step 1: 初始化上传
 	initReqID := GenerateReqId(WsCmd.UPLOAD_MEDIA_INIT)
@@ -638,7 +638,7 @@ func (c *WSClient) UploadMedia(fileBuffer []byte, options UploadMediaOptions) (*
 		return nil, fmt.Errorf("upload init failed: no upload_id returned")
 	}
 
-	c.logger.Info("Upload init success: upload_id=" + initResp.UploadID)
+	c.logger.Info("Upload init success: upload_id=%s", initResp.UploadID)
 
 	// Step 2: 分片上传（串行，避免并发问题）
 	for i := range totalChunks {
@@ -660,10 +660,10 @@ func (c *WSClient) UploadMedia(fileBuffer []byte, options UploadMediaOptions) (*
 			return nil, fmt.Errorf("chunk %d upload failed: %w", i, err)
 		}
 
-		c.logger.Debug(fmt.Sprintf("Uploaded chunk %d/%d (%d bytes)", i+1, totalChunks, len(chunk)))
+		c.logger.Debug("Uploaded chunk %d/%d (%d bytes)", i+1, totalChunks, len(chunk))
 	}
 
-	c.logger.Info(fmt.Sprintf("All %d chunks uploaded, finishing...", totalChunks))
+	c.logger.Info("All %d chunks uploaded, finishing...", totalChunks)
 
 	// Step 3: 完成上传
 	finishReqID := GenerateReqId(WsCmd.UPLOAD_MEDIA_FINISH)
@@ -680,7 +680,7 @@ func (c *WSClient) UploadMedia(fileBuffer []byte, options UploadMediaOptions) (*
 		return nil, fmt.Errorf("upload finish failed: no media_id returned")
 	}
 
-	c.logger.Info(fmt.Sprintf("Upload complete: media_id=%s, type=%s", finishResp.MediaID, finishResp.Type))
+	c.logger.Info("Upload complete: media_id=%s, type=%s", finishResp.MediaID, finishResp.Type)
 
 	return &finishResp, nil
 }
@@ -735,11 +735,11 @@ func (c *WSClient) DownloadFile(fileURL, aesKey string) ([]byte, string, error) 
 	// 下载加密的文件数据
 	result, err := c.apiClient.DownloadFileRaw(fileURL)
 	if err != nil {
-		c.logger.Error("File download failed: " + err.Error())
+		c.logger.Error("File download failed: %s", err.Error())
 		return nil, "", err
 	}
 
-	c.logger.Debug(fmt.Sprintf("Downloaded %d bytes, aesKey: %s", len(result.Buffer), aesKey))
+	c.logger.Debug("Downloaded %d bytes, aesKey: %s", len(result.Buffer), aesKey)
 
 	// 如果没有提供 aesKey，直接返回原始数据
 	if aesKey == "" {
@@ -750,7 +750,7 @@ func (c *WSClient) DownloadFile(fileURL, aesKey string) ([]byte, string, error) 
 	// 使用 AES-256-CBC 解密
 	decrypted, err := DecryptFile(result.Buffer, aesKey)
 	if err != nil {
-		c.logger.Error("File decryption failed: " + err.Error())
+		c.logger.Error("File decryption failed: %s", err.Error())
 		return nil, "", err
 	}
 

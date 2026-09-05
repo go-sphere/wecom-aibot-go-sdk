@@ -29,7 +29,7 @@ func NewMessageHandler(logger Logger) *MessageHandler {
 func (h *MessageHandler) HandleFrame(frame *WsFrame, emitter FrameEmitter) {
 	defer func() {
 		if r := recover(); r != nil {
-			h.logger.Error("Panic in HandleFrame: " + toString(r))
+			h.logger.Error("Panic in HandleFrame: %s", toString(r))
 		}
 	}()
 
@@ -41,7 +41,7 @@ func (h *MessageHandler) HandleFrame(frame *WsFrame, emitter FrameEmitter) {
 	// 解析 body 获取 msgtype
 	var bodyMap map[string]interface{}
 	if err := json.Unmarshal(frame.Body, &bodyMap); err != nil {
-		h.logger.Warn("Failed to parse message body: " + err.Error())
+		h.logger.Warn("Failed to parse message body: %s", err.Error())
 		return
 	}
 
@@ -66,7 +66,7 @@ func (h *MessageHandler) handleMessageCallback(frame *WsFrame, emitter FrameEmit
 	// 解析 body 获取具体消息类型
 	var bodyMap map[string]interface{}
 	if err := json.Unmarshal(frame.Body, &bodyMap); err != nil {
-		h.logger.Error("Failed to parse message body: " + err.Error())
+		h.logger.Error("Failed to parse message body: %s", err.Error())
 		return
 	}
 
@@ -90,7 +90,7 @@ func (h *MessageHandler) handleMessageCallback(frame *WsFrame, emitter FrameEmit
 	case string(MessageTypeVideo):
 		emitter.EmitMessageVideo(frame)
 	default:
-		h.logger.Debug("Received unhandled message type: " + msgtype)
+		h.logger.Debug("Received unhandled message type: %s", msgtype)
 	}
 }
 
@@ -99,7 +99,7 @@ func (h *MessageHandler) handleEventCallback(frame *WsFrame, emitter FrameEmitte
 	// 解析 body
 	var bodyMap map[string]interface{}
 	if err := json.Unmarshal(frame.Body, &bodyMap); err != nil {
-		h.logger.Error("Failed to parse event body: " + err.Error())
+		h.logger.Error("Failed to parse event body: %s", err.Error())
 		return
 	}
 
@@ -117,7 +117,7 @@ func (h *MessageHandler) handleEventCallback(frame *WsFrame, emitter FrameEmitte
 		eventMap = v
 	case string:
 		if err := json.Unmarshal([]byte(v), &eventMap); err != nil {
-			h.logger.Error("Failed to parse event JSON: " + err.Error())
+			h.logger.Error("Failed to parse event JSON: %s", err.Error())
 			return
 		}
 	default:
@@ -152,7 +152,7 @@ func (h *MessageHandler) handleEventCallback(frame *WsFrame, emitter FrameEmitte
 	case string(EventTypeDisconnected):
 		emitter.EmitEventDisconnected(frame)
 	default:
-		h.logger.Debug("Received unhandled event type: " + eventType)
+		h.logger.Debug("Received unhandled event type: %s", eventType)
 	}
 }
 

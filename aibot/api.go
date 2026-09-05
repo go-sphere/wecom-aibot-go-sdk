@@ -45,24 +45,24 @@ func (c *WeComApiClient) DownloadFileRaw(fileURL string) (*FileResult, error) {
 
 	resp, err := c.httpClient.Get(fileURL)
 	if err != nil {
-		c.logger.Error("File download failed: " + err.Error())
+		c.logger.Error("File download failed: %s", err.Error())
 		return nil, err
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
-			c.logger.Error("Failed to close response body: " + err.Error())
+			c.logger.Error("Failed to close response body: %s", err.Error())
 		}
 	}()
 
 	if resp.StatusCode != http.StatusOK {
-		c.logger.Error("File download failed, status: " + resp.Status)
+		c.logger.Error("File download failed, status: %s", resp.Status)
 		return nil, err
 	}
 
 	// 读取响应体
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		c.logger.Error("Failed to read response body: " + err.Error())
+		c.logger.Error("Failed to read response body: %s", err.Error())
 		return nil, err
 	}
 

@@ -199,7 +199,7 @@ func (m *WsConnectionManager) Connect() {
 		m.ws = nil
 	}
 
-	m.logger.Info("Connecting to WebSocket: " + m.wsURL + "...")
+	m.logger.Info("Connecting to WebSocket: %s...", m.wsURL)
 
 	go m.connect()
 }
@@ -212,7 +212,7 @@ func (m *WsConnectionManager) connect() {
 
 	ws, _, err := dialer.Dial(m.wsURL, nil)
 	if err != nil {
-		m.logger.Error("Failed to create WebSocket connection: " + err.Error())
+		m.logger.Error("Failed to create WebSocket connection: %s", err.Error())
 		if m.OnError != nil {
 			m.OnError(err)
 		}
@@ -254,7 +254,7 @@ func (m *WsConnectionManager) setupEventHandlers() {
 					return
 				}
 
-				m.logger.Error("WebSocket read error: " + err.Error())
+				m.logger.Error("WebSocket read error: %s", err.Error())
 				m.handleClose(err.Error())
 				return
 			}
@@ -268,7 +268,7 @@ func (m *WsConnectionManager) setupEventHandlers() {
 func (m *WsConnectionManager) handleMessage(data []byte) {
 	var frame WsFrame
 	if err := json.Unmarshal(data, &frame); err != nil {
-		m.logger.Error("Failed to parse WebSocket message: " + err.Error())
+		m.logger.Error("Failed to parse WebSocket message: %s", err.Error())
 		return
 	}
 
@@ -277,7 +277,7 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 
 	// 消息推送回调
 	if cmd == WsCmd.CALLBACK {
-		m.logger.Debug(fmt.Sprintf("[server -> plugin] cmd=%s, reqId=%s", cmd, reqID))
+		m.logger.Debug("[server -> plugin] cmd=%s, reqId=%s", cmd, reqID)
 		if m.OnMessage != nil {
 			m.OnMessage(&frame)
 		}
@@ -286,7 +286,7 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 
 	// 事件推送回调
 	if cmd == WsCmd.EVENT_CALLBACK {
-		m.logger.Debug(fmt.Sprintf("[server -> plugin] cmd=%s, reqId=%s", cmd, reqID))
+		m.logger.Debug("[server -> plugin] cmd=%s, reqId=%s", cmd, reqID)
 
 		// 检测 disconnected_event：有新连接建立，服务端通知旧连接即将被断开
 		if m.isDisconnectedEvent(&frame) {
@@ -339,7 +339,7 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 	}
 
 	// 未知帧类型 — 只记录警告，不传给 OnMessage
-	m.logger.Warn("Received unknown frame (ignored): " + string(data))
+	m.logger.Warn("Received unknown frame (ignored): %s", string(data))
 }
 
 // isDisconnectedEvent 检测是否为 disconnected_event
@@ -366,7 +366,7 @@ func (m *WsConnectionManager) isDisconnectedEvent(frame *WsFrame) bool {
 // handleAuthResponse 处理认证响应
 func (m *WsConnectionManager) handleAuthResponse(frame *WsFrame) {
 	if frame.ErrCode != 0 {
-		m.logger.Error(fmt.Sprintf("Authentication failed: errcode=%d, errmsg=%s", frame.ErrCode, frame.ErrMsg))
+		m.logger.Error("Authentication failed: errcode=%d, errmsg=%s", frame.ErrCode, frame.ErrMsg)
 		if m.OnError != nil {
 			m.OnError(fmt.Errorf("authentication failed: %s (code: %d)", frame.ErrMsg, frame.ErrCode))
 		}
@@ -392,7 +392,7 @@ func (m *WsConnectionManager) handleAuthResponse(frame *WsFrame) {
 // handleHeartbeatResponse 处理心跳响应
 func (m *WsConnectionManager) handleHeartbeatResponse(frame *WsFrame) {
 	if frame.ErrCode != 0 {
-		m.logger.Warn(fmt.Sprintf("Heartbeat ack error: errcode=%d, errmsg=%s", frame.ErrCode, frame.ErrMsg))
+		m.logger.Warn("Heartbeat ack error: errcode=%d, errmsg=%s", frame.ErrCode, frame.ErrMsg)
 		return
 	}
 
@@ -434,7 +434,7 @@ func (m *WsConnectionManager) sendAuth() {
 
 	bodyJSON, err := json.Marshal(authBody)
 	if err != nil {
-		m.logger.Error("Failed to marshal auth body: " + err.Error())
+		m.logger.Error("Failed to marshal auth body: %s", err.Error())
 		return
 	}
 
@@ -454,7 +454,7 @@ func (m *WsConnectionManager) sendAuth() {
 func (m *WsConnectionManager) sendHeartbeat() {
 	// 检查丢失 pong 次数
 	if m.missedPongCount >= maxMissedPong {
-		m.logger.Warn(fmt.Sprintf("No heartbeat ack received for %d consecutive pings, connection considered dead", m.missedPongCount))
+		m.logger.Warn("No heartbeat ack received for %d consecutive pings, connection considered dead", m.missedPongCount)
 		m.stopHeartbeat()
 		if m.ws != nil {
 			_ = m.ws.Close()
@@ -483,7 +483,7 @@ func (m *WsConnectionManager) startHeartbeat() {
 		m.sendHeartbeat,
 	)
 
-	m.logger.Debug(fmt.Sprintf("Heartbeat timer started, interval: %dms", m.heartbeatInterval))
+	m.logger.Debug("Heartbeat timer started, interval: %dms", m.heartbeatInterval)
 }
 
 // stopHeartbeat 停止心跳
@@ -505,7 +505,7 @@ func (m *WsConnectionManager) scheduleReconnect() {
 	if m.lastCloseWasAuthFailure {
 		// 认证失败场景
 		if m.maxAuthFailureAttempts > 0 && m.authFailureAttempts >= m.maxAuthFailureAttempts {
-			m.logger.Error(fmt.Sprintf("Max auth failure attempts reached (%d), giving up", m.maxAuthFailureAttempts))
+			m.logger.Error("Max auth failure attempts reached (%d), giving up", m.maxAuthFailureAttempts)
 			if m.OnError != nil {
 				m.OnError(&WSAuthFailureError{MaxAttempts: m.maxAuthFailureAttempts})
 			}
@@ -518,7 +518,7 @@ func (m *WsConnectionManager) scheduleReconnect() {
 			delay = reconnectMaxDelay
 		}
 
-		m.logger.Info(fmt.Sprintf("Auth failed, reconnecting in %dms (auth attempt %d/%d)...", delay, m.authFailureAttempts, m.maxAuthFailureAttempts))
+		m.logger.Info("Auth failed, reconnecting in %dms (auth attempt %d/%d)...", delay, m.authFailureAttempts, m.maxAuthFailureAttempts)
 		if m.OnReconnecting != nil {
 			m.OnReconnecting(m.authFailureAttempts)
 		}
@@ -536,7 +536,7 @@ func (m *WsConnectionManager) scheduleReconnect() {
 	} else {
 		// 连接断开场景（网络异常、心跳超时等）
 		if m.maxReconnectAttempts > 0 && m.reconnectAttempts >= m.maxReconnectAttempts {
-			m.logger.Error(fmt.Sprintf("Max reconnect attempts reached (%d), giving up", m.maxReconnectAttempts))
+			m.logger.Error("Max reconnect attempts reached (%d), giving up", m.maxReconnectAttempts)
 			if m.OnError != nil {
 				m.OnError(&WSReconnectExhaustedError{MaxAttempts: m.maxReconnectAttempts})
 			}
@@ -549,7 +549,7 @@ func (m *WsConnectionManager) scheduleReconnect() {
 			delay = reconnectMaxDelay
 		}
 
-		m.logger.Info(fmt.Sprintf("Connection lost, reconnecting in %dms (attempt %d/%d)...", delay, m.reconnectAttempts, m.maxReconnectAttempts))
+		m.logger.Info("Connection lost, reconnecting in %dms (attempt %d/%d)...", delay, m.reconnectAttempts, m.maxReconnectAttempts)
 		if m.OnReconnecting != nil {
 			m.OnReconnecting(m.reconnectAttempts)
 		}
@@ -575,12 +575,12 @@ func (m *WsConnectionManager) sendFrame(frame WsFrame) {
 
 	data, err := json.Marshal(frame)
 	if err != nil {
-		m.logger.Error("Failed to marshal frame: " + err.Error())
+		m.logger.Error("Failed to marshal frame: %s", err.Error())
 		return
 	}
 
 	if err := m.ws.WriteMessage(websocket.TextMessage, data); err != nil {
-		m.logger.Error("Failed to send frame: " + err.Error())
+		m.logger.Error("Failed to send frame: %s", err.Error())
 	}
 }
 
@@ -657,7 +657,7 @@ func (m *WsConnectionManager) enqueueReply(reqID string, item replyQueueItem) {
 
 	// 防止队列无限增长
 	if len(queue) >= m.maxReplyQueueSize {
-		m.logger.Warn(fmt.Sprintf("Reply queue for reqId %s exceeds max size (%d), rejecting new message", reqID, m.maxReplyQueueSize))
+		m.logger.Warn("Reply queue for reqId %s exceeds max size (%d), rejecting new message", reqID, m.maxReplyQueueSize)
 		item.reject(fmt.Errorf("reply queue for reqId %s exceeds max size", reqID))
 		return
 	}
@@ -685,7 +685,7 @@ func (m *WsConnectionManager) processReplyQueue(reqID string) {
 
 	// 发送帧
 	if err := m.Send(item.frame); err != nil {
-		m.logger.Error(fmt.Sprintf("Failed to send reply for reqId %s: %s", reqID, err.Error()))
+		m.logger.Error("Failed to send reply for reqId %s: %s", reqID, err.Error())
 
 		m.replyQueuesMu.Lock()
 		if q, exists := m.replyQueues[reqID]; exists && len(q) > 0 {
@@ -699,7 +699,7 @@ func (m *WsConnectionManager) processReplyQueue(reqID string) {
 		return
 	}
 
-	m.logger.Debug(fmt.Sprintf("Reply message sent via WebSocket, reqId: %s", reqID))
+	m.logger.Debug("Reply message sent via WebSocket, reqId: %s", reqID)
 
 	// 设置回执超时
 	m.addPendingAck(reqID, item.resolve, item.reject)
@@ -766,10 +766,10 @@ func (m *WsConnectionManager) handleReplyAck(reqID string, frame *WsFrame) {
 	m.replyQueuesMu.Unlock()
 
 	if frame.ErrCode != 0 {
-		m.logger.Warn(fmt.Sprintf("Reply ack error: reqId=%s, errcode=%d, errmsg=%s", reqID, frame.ErrCode, frame.ErrMsg))
+		m.logger.Warn("Reply ack error: reqId=%s, errcode=%d, errmsg=%s", reqID, frame.ErrCode, frame.ErrMsg)
 		pending.reject(fmt.Errorf("reply ack error: %s (code: %d)", frame.ErrMsg, frame.ErrCode))
 	} else {
-		m.logger.Debug(fmt.Sprintf("Reply ack received for reqId: %s", reqID))
+		m.logger.Debug("Reply ack received for reqId: %s", reqID)
 		pending.resolve(frame)
 	}
 
@@ -795,7 +795,7 @@ func (m *WsConnectionManager) handleReplyAckTimeout(reqID string, seq uint64) {
 	delete(m.pendingAcks, reqID)
 	m.pendingAcksMu.Unlock()
 
-	m.logger.Warn(fmt.Sprintf("Reply ack timeout (%dms) for reqId: %s", replyAckTimeout, reqID))
+	m.logger.Warn("Reply ack timeout (%dms) for reqId: %s", replyAckTimeout, reqID)
 
 	// 从队列中移除
 	m.replyQueuesMu.Lock()
