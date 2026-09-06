@@ -76,15 +76,7 @@ type WSClient struct {
 // NewWSClient 创建 WSClient 实例
 func NewWSClient(options WSClientOptions) *WSClient {
 	// 设置默认值
-	opts := RequiredWSClientOptions{
-		ReconnectInterval:      1000,
-		MaxReconnectAttempts:   10,
-		MaxAuthFailureAttempts: 5,
-		HeartbeatInterval:      30000,
-		RequestTimeout:         10000,
-		MaxReplyQueueSize:      500,
-		WSURL:                  "wss://openws.work.weixin.qq.com",
-	}
+	opts := DefaultWSClientOptions
 
 	if options.ReconnectInterval > 0 {
 		opts.ReconnectInterval = options.ReconnectInterval
@@ -153,21 +145,21 @@ func NewWSClient(options WSClientOptions) *WSClient {
 // setupWsEvents 设置 WebSocket 事件处理
 func (c *WSClient) setupWsEvents() {
 	c.wsManager.OnConnected = func() {
-		if c.onConnected != nil {
-			c.onConnected()
+		if handler := c.connectedHandler(); handler != nil {
+			handler()
 		}
 	}
 
 	c.wsManager.OnAuthenticated = func() {
 		c.logger.Info("Authenticated")
-		if c.onAuthenticated != nil {
-			c.onAuthenticated()
+		if handler := c.authenticatedHandler(); handler != nil {
+			handler()
 		}
 	}
 
 	c.wsManager.OnDisconnected = func(reason string) {
-		if c.onDisconnected != nil {
-			c.onDisconnected(reason)
+		if handler := c.disconnectedHandler(); handler != nil {
+			handler(reason)
 		}
 	}
 
@@ -177,20 +169,28 @@ func (c *WSClient) setupWsEvents() {
 		c.mu.Lock()
 		c.started = false
 		c.mu.Unlock()
-		if c.onDisconnected != nil {
-			c.onDisconnected(reason)
+		if handler := c.disconnectedHandler(); handler != nil {
+			handler(reason)
 		}
 	}
 
 	c.wsManager.OnReconnecting = func(attempt int) {
-		if c.onReconnecting != nil {
-			c.onReconnecting(attempt)
+		if handler := c.reconnectingHandler(); handler != nil {
+			handler(attempt)
 		}
 	}
 
 	c.wsManager.OnError = func(err error) {
-		if c.onError != nil {
-			c.onError(err)
+		// 重连/认证重试耗尽：SDK 已停止自动重连，复位 started 以允许用户再次 Connect()
+		var authErr *WSAuthFailureError
+		var reconnectErr *WSReconnectExhaustedError
+		if errors.As(err, &authErr) || errors.As(err, &reconnectErr) {
+			c.mu.Lock()
+			c.started = false
+			c.mu.Unlock()
+		}
+		if handler := c.errorHandler(); handler != nil {
+			handler(err)
 		}
 	}
 
@@ -204,7 +204,8 @@ func (c *WSClient) setupWsEvents() {
 // ============================================================================
 
 // Connect 建立 WebSocket 长连接
-// SDK 使用内置默认地址建立连接，连接成功后自动发送认证帧（botId + secret）
+// SDK 使用内置默认地址建立连接，连接成功后自动发送认证帧（botId + secret）。
+// 连接断开或认证失败重试耗尽后（started 已被复位），可再次调用 Connect() 重新发起连接。
 func (c *WSClient) Connect() *WSClient {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -249,87 +250,227 @@ func (c *WSClient) IsConnected() bool {
 
 // OnMessage 收到消息（所有类型）
 func (c *WSClient) OnMessage(handler MessageHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onMessage = handler
 }
 
 // OnMessageText 收到文本消息
 func (c *WSClient) OnMessageText(handler MessageHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onMessageText = handler
 }
 
 // OnMessageImage 收到图片消息
 func (c *WSClient) OnMessageImage(handler MessageHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onMessageImage = handler
 }
 
 // OnMessageMixed 收到图文混排消息
 func (c *WSClient) OnMessageMixed(handler MessageHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onMessageMixed = handler
 }
 
 // OnMessageVoice 收到语音消息
 func (c *WSClient) OnMessageVoice(handler MessageHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onMessageVoice = handler
 }
 
 // OnMessageFile 收到文件消息
 func (c *WSClient) OnMessageFile(handler MessageHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onMessageFile = handler
 }
 
 // OnMessageVideo 收到视频消息
 func (c *WSClient) OnMessageVideo(handler MessageHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onMessageVideo = handler
 }
 
 // OnEvent 收到事件回调（所有事件类型）
 func (c *WSClient) OnEvent(handler EventHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onEvent = handler
 }
 
 // OnEventEnterChat 收到进入会话事件
 func (c *WSClient) OnEventEnterChat(handler EventHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onEventEnterChat = handler
 }
 
 // OnEventTemplateCardEvent 收到模板卡片事件
 func (c *WSClient) OnEventTemplateCardEvent(handler EventHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onEventTemplateCardEvent = handler
 }
 
 // OnEventFeedbackEvent 收到用户反馈事件
 func (c *WSClient) OnEventFeedbackEvent(handler EventHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onEventFeedbackEvent = handler
 }
 
 // OnEventDisconnected 收到连接断开事件（有新连接建立，服务端主动断开当前旧连接）
 func (c *WSClient) OnEventDisconnected(handler EventHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onEventDisconnected = handler
 }
 
 // OnConnected 连接建立
 func (c *WSClient) OnConnected(handler ConnectionHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onConnected = handler
 }
 
 // OnAuthenticated 认证成功
 func (c *WSClient) OnAuthenticated(handler ConnectionHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onAuthenticated = handler
 }
 
 // OnDisconnected 连接断开
 func (c *WSClient) OnDisconnected(handler DisconnectHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onDisconnected = handler
 }
 
 // OnReconnecting 重连中
 func (c *WSClient) OnReconnecting(handler ReconnectHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onReconnecting = handler
 }
 
 // OnError 发生错误
 func (c *WSClient) OnError(handler ErrorHandlerFunc) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.onError = handler
+}
+
+// ============================================================================
+// Handler 快照读取（分发线程在锁外调用，读取时加锁取当前值）
+// ============================================================================
+
+func (c *WSClient) messageHandler_() MessageHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onMessage
+}
+
+func (c *WSClient) messageTextHandler() MessageHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onMessageText
+}
+
+func (c *WSClient) messageImageHandler() MessageHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onMessageImage
+}
+
+func (c *WSClient) messageMixedHandler() MessageHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onMessageMixed
+}
+
+func (c *WSClient) messageVoiceHandler() MessageHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onMessageVoice
+}
+
+func (c *WSClient) messageFileHandler() MessageHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onMessageFile
+}
+
+func (c *WSClient) messageVideoHandler() MessageHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onMessageVideo
+}
+
+func (c *WSClient) eventHandler() EventHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onEvent
+}
+
+func (c *WSClient) eventEnterChatHandler() EventHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onEventEnterChat
+}
+
+func (c *WSClient) eventTemplateCardEventHandler() EventHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onEventTemplateCardEvent
+}
+
+func (c *WSClient) eventFeedbackEventHandler() EventHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onEventFeedbackEvent
+}
+
+func (c *WSClient) eventDisconnectedHandler() EventHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onEventDisconnected
+}
+
+func (c *WSClient) connectedHandler() ConnectionHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onConnected
+}
+
+func (c *WSClient) authenticatedHandler() ConnectionHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onAuthenticated
+}
+
+func (c *WSClient) disconnectedHandler() DisconnectHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onDisconnected
+}
+
+func (c *WSClient) reconnectingHandler() ReconnectHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onReconnecting
+}
+
+func (c *WSClient) errorHandler() ErrorHandlerFunc {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.onError
 }
 
 // ============================================================================
@@ -337,74 +478,74 @@ func (c *WSClient) OnError(handler ErrorHandlerFunc) {
 // ============================================================================
 
 func (c *WSClient) EmitMessage(frame *WsFrame) {
-	if c.onMessage != nil {
-		c.onMessage(frame)
+	if h := c.messageHandler_(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitMessageText(frame *WsFrame) {
-	if c.onMessageText != nil {
-		c.onMessageText(frame)
+	if h := c.messageTextHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitMessageImage(frame *WsFrame) {
-	if c.onMessageImage != nil {
-		c.onMessageImage(frame)
+	if h := c.messageImageHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitMessageMixed(frame *WsFrame) {
-	if c.onMessageMixed != nil {
-		c.onMessageMixed(frame)
+	if h := c.messageMixedHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitMessageVoice(frame *WsFrame) {
-	if c.onMessageVoice != nil {
-		c.onMessageVoice(frame)
+	if h := c.messageVoiceHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitMessageFile(frame *WsFrame) {
-	if c.onMessageFile != nil {
-		c.onMessageFile(frame)
+	if h := c.messageFileHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitMessageVideo(frame *WsFrame) {
-	if c.onMessageVideo != nil {
-		c.onMessageVideo(frame)
+	if h := c.messageVideoHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitEvent(frame *WsFrame) {
-	if c.onEvent != nil {
-		c.onEvent(frame)
+	if h := c.eventHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitEventEnterChat(frame *WsFrame) {
-	if c.onEventEnterChat != nil {
-		c.onEventEnterChat(frame)
+	if h := c.eventEnterChatHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitEventTemplateCardEvent(frame *WsFrame) {
-	if c.onEventTemplateCardEvent != nil {
-		c.onEventTemplateCardEvent(frame)
+	if h := c.eventTemplateCardEventHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitEventFeedbackEvent(frame *WsFrame) {
-	if c.onEventFeedbackEvent != nil {
-		c.onEventFeedbackEvent(frame)
+	if h := c.eventFeedbackEventHandler(); h != nil {
+		h(frame)
 	}
 }
 
 func (c *WSClient) EmitEventDisconnected(frame *WsFrame) {
-	if c.onEventDisconnected != nil {
-		c.onEventDisconnected(frame)
+	if h := c.eventDisconnectedHandler(); h != nil {
+		h(frame)
 	}
 }
 
@@ -558,13 +699,37 @@ func (c *WSClient) UpdateTemplateCard(frame *WsFrame, templateCard TemplateCard,
 func (c *WSClient) SendMessage(chatID string, body interface{}) (*WsFrame, error) {
 	reqID := GenerateReqId(WsCmd.SEND_MSG)
 
-	var bodyMap map[string]interface{}
-	bodyBytes, _ := json.Marshal(body)
-	_ = json.Unmarshal(bodyBytes, &bodyMap)
+	// 将 body 合入信封并附加 chatid。
+	// 先序列化 body 为 JSON 对象再追加字段，避免对 nil/非对象输入 panic。
+	bodyMap, err := objectMap(body)
+	if err != nil {
+		return nil, err
+	}
 
 	bodyMap["chatid"] = chatID
 
 	return c.wsManager.SendReply(reqID, bodyMap, WsCmd.SEND_MSG)
+}
+
+// objectMap 将输入转换为 map[string]interface{}。
+// 输入必须是可序列化为 JSON 对象的类型（map、struct、指向它们的指针），
+// 否则返回错误；nil、null、数组、标量等非法输入不会 panic。
+func objectMap(v interface{}) (map[string]interface{}, error) {
+	if v == nil {
+		return nil, errors.New("SendMessage: body must not be nil")
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("SendMessage: failed to serialize body: %w", err)
+	}
+	m := make(map[string]interface{})
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("SendMessage: body must be a JSON object (map or struct), got %T", v)
+	}
+	if m == nil { // JSON null 会成功反序列化为 nil map
+		return nil, fmt.Errorf("SendMessage: body must be a JSON object (map or struct), got %T", v)
+	}
+	return m, nil
 }
 
 // SendMarkdown 发送 Markdown 消息
@@ -739,7 +904,7 @@ func (c *WSClient) DownloadFile(fileURL, aesKey string) ([]byte, string, error) 
 		return nil, "", err
 	}
 
-	c.logger.Debug("Downloaded %d bytes, aesKey: %s", len(result.Buffer), aesKey)
+	c.logger.Debug("Downloaded %d bytes", len(result.Buffer))
 
 	// 如果没有提供 aesKey，直接返回原始数据
 	if aesKey == "" {
@@ -903,17 +1068,3 @@ func CreateStreamReplyBody(streamID, content string, finish bool, msgItem []Repl
 		"stream":  stream,
 	}
 }
-
-// ============================================================================
-// SDK 初始化（用于 init 函数）
-// ============================================================================
-
-// 确保 RequiredWSClientOptions 实现了默认值的接口
-var _ = func() error {
-	opts := WSClientOptions{
-		BotID:  "test",
-		Secret: "test",
-	}
-	_ = opts
-	return nil
-}()

@@ -3,14 +3,13 @@ package aibot
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"encoding/base64"
 	"errors"
 )
 
 // DecryptFile 使用 AES-256-CBC 解密文件
 //
 //	encryptedData - 加密的文件数据
-//	aesKey       - Base64 编码的 AES-256 密钥（43字符的 Base64 字符串，需要添加 padding）
+//	aesKey       - Base64 编码的 AES-256 密钥（43字符的 Base64 字符串，可能带或不带 padding）
 //
 // 返回解密后的文件数据
 func DecryptFile(encryptedData []byte, aesKey string) ([]byte, error) {
@@ -23,18 +22,10 @@ func DecryptFile(encryptedData []byte, aesKey string) ([]byte, error) {
 		return nil, errors.New("decryptFile: aesKey must be a non-empty string")
 	}
 
-	// 添加 padding（encodingAESKey 是 43 字符的 Base64，解码后 32 字节）
-	aesKeyWithPadding := aesKey + "="
-
-	// 将 Base64 编码的 aesKey 解码
-	key, err := base64.StdEncoding.DecodeString(aesKeyWithPadding)
+	// 复用 DecodeEncodingAESKey：兼容 43 字符（缺 padding）与 44 字符（带 padding）两种输入
+	key, err := DecodeEncodingAESKey(aesKey)
 	if err != nil {
-		return nil, errors.New("decryptFile: failed to decode aesKey from base64: " + err.Error())
-	}
-
-	// 密钥必须是 32 字节 (AES-256)
-	if len(key) != 32 {
-		return nil, errors.New("decryptFile: aesKey must be 32 bytes (256 bits) after base64 decoding")
+		return nil, errors.New("decryptFile: " + err.Error())
 	}
 
 	// 创建 AES 块

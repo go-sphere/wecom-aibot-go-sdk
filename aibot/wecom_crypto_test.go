@@ -1,6 +1,10 @@
 package aibot
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -162,5 +166,86 @@ func TestPKCS7Unpad(t *testing.T) {
 	_, err = PKCS7Unpad(badPad, 32)
 	if err == nil {
 		t.Fatal("Expected error for mismatched padding byte")
+	}
+}
+
+func TestWecomCrypto_DecryptInvalidCiphertextLength(t *testing.T) {
+	encodingAESKey := "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+	crypto, err := NewWecomCrypto("token", encodingAESKey, "corpid")
+	if err != nil {
+		t.Fatalf("NewWecomCrypto failed: %v", err)
+	}
+
+	// 20 字节密文：非 16 的整数倍，CBC 解密会 panic（若缺少长度校验）。
+	// 构造任意 20 字节的 base64 密文。
+	bad := base64.StdEncoding.EncodeToString(make([]byte, 20))
+	if _, err := crypto.Decrypt(bad); err == nil {
+		t.Fatal("Decrypt with non-block-aligned ciphertext succeeded, want error")
+	}
+
+	// 空密文同样应报错而非 panic
+	if _, err := crypto.Decrypt(""); err == nil {
+		t.Fatal("Decrypt with empty ciphertext succeeded, want error")
+	}
+
+	// 合法长度的密文（16 字节，解密后 padding 校验会失败）只应返回错误，不应 panic
+	validLen := base64.StdEncoding.EncodeToString(make([]byte, aes.BlockSize))
+	if _, err := crypto.Decrypt(validLen); err == nil {
+		t.Fatal("Decrypt with 16-byte garbage succeeded, want error")
+	}
+}
+
+func TestDecryptFile_AcceptsPaddedAESKey(t *testing.T) {
+	encodingAESKey := "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+	key, err := DecodeEncodingAESKey(encodingAESKey)
+	if err != nil {
+		t.Fatalf("DecodeEncodingAESKey failed: %v", err)
+	}
+
+	// DecryptFile 解密的是企微媒体文件格式：AES-256-CBC(key 前 16 字节为 IV)，PKCS#7 填充到 32
+	plaintext := []byte("hello file content, pad me to 32 bytes boundary!")
+	encryptedData := aesEncryptFile(t, key, plaintext)
+
+	// 用带 padding 的 44 字符 key 解密：DecryptFile 应能正常处理（回归 RF-007）
+	got, err := DecryptFile(encryptedData, encodingAESKey+"=")
+	if err != nil {
+		t.Fatalf("DecryptFile with padded key failed: %v", err)
+	}
+	if string(got) != string(plaintext) {
+		t.Fatalf("DecryptFile mismatch: got %q, want %q", got, plaintext)
+	}
+
+	// 无 padding 的 43 字符 key 也应能解密
+	got2, err := DecryptFile(encryptedData, encodingAESKey)
+	if err != nil {
+		t.Fatalf("DecryptFile with unpadded key failed: %v", err)
+	}
+	if string(got2) != string(plaintext) {
+		t.Fatalf("DecryptFile(unpadded) mismatch: got %q, want %q", got2, plaintext)
+	}
+}
+
+// aesEncryptFile 按 DecryptFile 对应的媒体文件格式加密：AES-256-CBC + PKCS#7(32)。
+func aesEncryptFile(t *testing.T, key, plaintext []byte) []byte {
+	t.Helper()
+	padded := PKCS7Pad(plaintext, PKCS7BlockSize)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatalf("aes.NewCipher failed: %v", err)
+	}
+	iv := key[:aes.BlockSize]
+	out := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out, padded)
+	return out
+}
+
+func TestDecryptFile_InvalidAESKey(t *testing.T) {
+	encryptedData := make([]byte, 32)
+	_, err := DecryptFile(encryptedData, "invalid-key-length")
+	if err == nil {
+		t.Fatal("DecryptFile with invalid key succeeded, want error")
+	}
+	if !strings.Contains(err.Error(), "decryptFile") {
+		t.Fatalf("error lacks decryptFile prefix: %v", err)
 	}
 }

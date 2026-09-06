@@ -1,6 +1,7 @@
 package aibot
 
 import (
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -56,7 +57,9 @@ func (c *WeComApiClient) DownloadFileRaw(fileURL string) (*FileResult, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		c.logger.Error("File download failed, status: %s", resp.Status)
-		return nil, err
+		// 排空响应体以便复用底层连接，并返回明确错误而非 (nil, nil)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("file download failed with status %s", resp.Status)
 	}
 
 	// 读取响应体

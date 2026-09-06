@@ -135,6 +135,11 @@ func (c *WecomCrypto) Decrypt(encryptText string) (string, error) {
 		return "", fmt.Errorf("failed to decode encryptText: %w", err)
 	}
 
+	// CBC 要求密文长度为块大小（16 字节）的整数倍，否则 CryptBlocks 直接 panic
+	if len(encryptedData) == 0 || len(encryptedData)%aes.BlockSize != 0 {
+		return "", fmt.Errorf("invalid ciphertext length (%d bytes); must be a non-zero multiple of %d", len(encryptedData), aes.BlockSize)
+	}
+
 	mode := cipher.NewCBCDecrypter(block, c.iv)
 	decryptedPadded := make([]byte, len(encryptedData))
 	mode.CryptBlocks(decryptedPadded, encryptedData)

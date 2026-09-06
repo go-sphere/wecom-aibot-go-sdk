@@ -1,7 +1,6 @@
 package aibot
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -26,10 +25,17 @@ const (
 	maxMissedPong             = 2     // 最大丢失 pong 次数
 
 	// 队列参数
-	replyAckTimeout            = 5000 // 回执超时 (ms)
+	replyAckTimeoutMs          = 5000 // 回执超时 (ms)
 	defaultMaxReplyQueueSize   = 500  // 单个 req_id 的默认最大队列长度
 	defaultMaxAuthFailAttempts = 5    // 默认认证失败最大重试次数
 )
+
+// replyAckTimeout 回执超时（毫秒）。原子变量：正常保持默认值，测试可缩短超时。
+var replyAckTimeout atomic.Int64
+
+func init() {
+	replyAckTimeout.Store(replyAckTimeoutMs)
+}
 
 // ============================================================================
 // 回调函数类型
@@ -82,6 +88,11 @@ type WsConnectionManager struct {
 	wsMu sync.RWMutex // 保护 ws 字段的并发读写
 	ws   *websocket.Conn
 
+	// writeMu 串行化对连接的所有写入。gorilla 的 WriteMessage 只在底层 socket 写
+	// 层面加锁，beginMessage/endMessage 与 writeBuf 等字段跨 goroutine 并发不安全，
+	// 心跳定时器、认证帧与用户 Send/SendReply 来自不同 goroutine，必须统一串行化。
+	writeMu sync.Mutex
+
 	isManualClose bool
 
 	// 认证凭证
@@ -93,11 +104,14 @@ type WsConnectionManager struct {
 	reconnectAttempts       int
 	authFailureAttempts     int
 	lastCloseWasAuthFailure bool
-	missedPongCount         int
+	missedPongCount         atomic.Int32
 
 	// 定时器
-	heartbeatTimer *time.Timer
 	reconnectTimer *time.Timer
+
+	// 心跳协程停止信号
+	heartbeatStop chan struct{}
+	heartbeatMu   sync.Mutex
 
 	// 回复队列
 	replyQueues   map[string][]replyQueueItem
@@ -114,10 +128,6 @@ type WsConnectionManager struct {
 	OnMessage          OnMessageFunc
 	OnReconnecting     OnReconnectingFunc
 	OnError            OnErrorFunc
-
-	// 上下文和取消
-	ctx    context.Context
-	cancel context.CancelFunc
 }
 
 // pendingAck 待回执项
@@ -158,8 +168,6 @@ func NewWsConnectionManager(
 		maxAuthFailureAttempts = defaultMaxAuthFailAttempts
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
 	return &WsConnectionManager{
 		logger:                 logger,
 		wsURL:                  wsURL,
@@ -172,9 +180,6 @@ func NewWsConnectionManager(
 
 		replyQueues: make(map[string][]replyQueueItem),
 		pendingAcks: make(map[string]*pendingAck),
-
-		ctx:    ctx,
-		cancel: cancel,
 	}
 }
 
@@ -187,13 +192,23 @@ func (m *WsConnectionManager) SetCredentials(botID, botSecret string, extraAuthP
 
 // Connect 建立 WebSocket 连接
 func (m *WsConnectionManager) Connect() {
-	m.isManualClose = false
+	// 连接生命周期可重启：每次 Connect 都是全新开始，取消挂起的重连定时器并关闭旧连接，
+	// 复位手动关闭标记与重试计数器。
+	m.beginConnect(true)
+}
 
-	// 取消挂起的重连定时器，防止与当前 connect 竞态
-	if m.reconnectTimer != nil {
-		m.reconnectTimer.Stop()
-		m.reconnectTimer = nil
+// reconnect 自动重连：保留重试计数器（authFailureAttempts/reconnectAttempts 不清零），
+// 使"最大重试次数"在单个连接生命周期内真正生效。
+func (m *WsConnectionManager) reconnect() {
+	m.beginConnect(false)
+}
+
+func (m *WsConnectionManager) beginConnect(fresh bool) {
+	if fresh {
+		m.setManualClosed(false)
 	}
+	// 取消挂起的重连定时器，防止与当前 connect 竞态
+	m.stopReconnectTimer()
 
 	// 清理可能未完全关闭的旧连接
 	m.closeConn()
@@ -219,9 +234,19 @@ func (m *WsConnectionManager) connect() {
 		return
 	}
 
-	m.setConn(ws)
-	m.missedPongCount = 0
+	// 安装新连接。若拨号期间已被手动关闭（Disconnect/Connect 竞态），
+	// 则丢弃该连接，避免在已断开状态下残留一个无读协程的活连接。
+	m.wsMu.Lock()
+	if m.isManualClose {
+		m.wsMu.Unlock()
+		_ = ws.Close()
+		return
+	}
+	m.ws = ws
+	m.missedPongCount.Store(0)
 	m.lastCloseWasAuthFailure = false
+	m.wsMu.Unlock()
+
 	m.setupEventHandlers()
 
 	// 连接建立后立即发送认证帧
@@ -244,16 +269,21 @@ func (m *WsConnectionManager) setupEventHandlers() {
 	// 而不是循环内反复读 m.ws —— m.ws 可能被 Disconnect/Connect/断线清理置 nil 或替换，
 	// 循环内读取会造成对已关闭连接甚至 nil 的解引用。
 	go func() {
-		for {
-			select {
-			case <-m.ctx.Done():
-				return
-			default:
-			}
+		defer func() {
+			// 释放本次连接的底层资源；重复 Close 是安全的
+			_ = conn.Close()
+		}()
 
+		for {
 			_, data, err := conn.ReadMessage()
 			if err != nil {
-				if m.isManualClose {
+				// 手动关闭（Disconnect/被踢下线）或连接已被更新换代（m.ws != conn）时，
+				// 收尾逻辑由发起方负责，本协程静默退出，避免旧连接的关闭误伤新连接。
+				m.wsMu.RLock()
+				manual := m.isManualClose
+				isCurrent := m.ws == conn
+				m.wsMu.RUnlock()
+				if manual || !isCurrent {
 					return
 				}
 
@@ -301,8 +331,9 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 			// 停止心跳、清理待处理消息
 			m.stopHeartbeat()
 			m.clearPendingMessages("Server disconnected due to new connection")
-			// 标记为非手动断开但阻止自动重连（服务端正常行为，重连也会被再次断开）
-			m.isManualClose = true
+			// 标记为手动断开语义以阻止自动重连（服务端正常行为，重连也会被再次断开）；
+			// 之后用户仍可显式调用 Connect() 重新建立连接。
+			m.setManualClosed(true)
 			// 通知上层服务端主动断开
 			if m.OnServerDisconnect != nil {
 				m.OnServerDisconnect("New connection established, server disconnected this connection")
@@ -372,17 +403,23 @@ func (m *WsConnectionManager) handleAuthResponse(frame *WsFrame) {
 		if m.OnError != nil {
 			m.OnError(fmt.Errorf("authentication failed: %s (code: %d)", frame.ErrMsg, frame.ErrCode))
 		}
-		// 标记为认证失败，close 事件中 scheduleReconnect 会据此使用 authFailureAttempts 计数器
+		// 标记为认证失败，scheduleReconnect 会据此使用 authFailureAttempts 计数器
+		m.wsMu.Lock()
 		m.lastCloseWasAuthFailure = true
-		// 认证失败，主动关闭连接，触发 close → handleClose → scheduleReconnect
+		m.wsMu.Unlock()
+		// 认证失败，主动关闭连接并走完整的关闭处理（closeConn 会使读协程变陈旧而静默退出，
+		// 因此必须在这里直接触发 handleClose → scheduleReconnect）。
 		m.closeConn()
+		m.handleClose("authentication failed")
 		return
 	}
 
 	m.logger.Info("Authentication successful")
 	// 认证成功：重置所有重连计数器
+	m.wsMu.Lock()
 	m.reconnectAttempts = 0
 	m.authFailureAttempts = 0
+	m.wsMu.Unlock()
 	m.startHeartbeat()
 	if m.OnAuthenticated != nil {
 		m.OnAuthenticated()
@@ -396,7 +433,7 @@ func (m *WsConnectionManager) handleHeartbeatResponse(frame *WsFrame) {
 		return
 	}
 
-	m.missedPongCount = 0
+	m.missedPongCount.Store(0)
 }
 
 // handleClose 处理连接关闭
@@ -411,7 +448,7 @@ func (m *WsConnectionManager) handleClose(reason string) {
 		m.OnDisconnected(reason)
 	}
 
-	if !m.isManualClose {
+	if !m.isManualClosed() {
 		m.scheduleReconnect()
 	}
 }
@@ -451,17 +488,19 @@ func (m *WsConnectionManager) sendAuth() {
 	m.logger.Info("Auth frame sent")
 }
 
-// sendHeartbeat 发送心跳
+// sendHeartbeat 发送心跳（由心跳协程周期性调用）
 func (m *WsConnectionManager) sendHeartbeat() {
 	// 检查丢失 pong 次数
-	if m.missedPongCount >= maxMissedPong {
-		m.logger.Warn("No heartbeat ack received for %d consecutive pings, connection considered dead", m.missedPongCount)
-		m.stopHeartbeat()
+	if m.missedPongCount.Load() >= maxMissedPong {
+		m.logger.Warn("No heartbeat ack received for %d consecutive pings, connection considered dead", m.missedPongCount.Load())
 		m.closeConn()
+		// 心跳超时按连接断开处理：读协程可能仍阻塞在 ReadMessage 上，
+		// 因此这里显式触发 handleClose 进入重连流程（closeConn 会使读协程变陈旧而静默退出）
+		m.handleClose("heartbeat timeout")
 		return
 	}
 
-	m.missedPongCount++
+	m.missedPongCount.Add(1)
 
 	frame := WsFrame{
 		Cmd: WsCmd.HEARTBEAT,
@@ -473,24 +512,45 @@ func (m *WsConnectionManager) sendHeartbeat() {
 	m.sendFrame(frame)
 }
 
+// heartbeatLoop 心跳协程：以固定间隔周期性发送心跳，直到收到停止信号或
+// 发送心跳时发现连接已死亡/被手动关闭（此时主动退出）。
+func (m *WsConnectionManager) heartbeatLoop(stop <-chan struct{}) {
+	interval := time.Duration(m.heartbeatInterval) * time.Millisecond
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			// 连接已关闭或被手动断开时不再发送心跳
+			if m.getConn() == nil || m.isManualClosed() {
+				return
+			}
+			m.sendHeartbeat()
+		}
+	}
+}
+
 // startHeartbeat 启动心跳
 func (m *WsConnectionManager) startHeartbeat() {
 	m.stopHeartbeat()
 
-	m.heartbeatTimer = time.AfterFunc(
-		time.Duration(m.heartbeatInterval)*time.Millisecond,
-		m.sendHeartbeat,
-	)
+	stop := make(chan struct{})
+	m.heartbeatStop = stop
+	go m.heartbeatLoop(stop)
 
-	m.logger.Debug("Heartbeat timer started, interval: %dms", m.heartbeatInterval)
+	m.logger.Debug("Heartbeat started, interval: %dms", m.heartbeatInterval)
 }
 
 // stopHeartbeat 停止心跳
 func (m *WsConnectionManager) stopHeartbeat() {
-	if m.heartbeatTimer != nil {
-		m.heartbeatTimer.Stop()
-		m.heartbeatTimer = nil
+	m.heartbeatMu.Lock()
+	if m.heartbeatStop != nil {
+		close(m.heartbeatStop)
+		m.heartbeatStop = nil
 	}
+	m.heartbeatMu.Unlock()
 }
 
 // scheduleReconnect 安排重连
@@ -501,6 +561,9 @@ func (m *WsConnectionManager) stopHeartbeat() {
 //
 // disconnected_event（被踢下线）不会触发重连，因为 isManualClose 已被设为 true。
 func (m *WsConnectionManager) scheduleReconnect() {
+	m.wsMu.Lock()
+	defer m.wsMu.Unlock()
+
 	if m.lastCloseWasAuthFailure {
 		// 认证失败场景
 		if m.maxAuthFailureAttempts > 0 && m.authFailureAttempts >= m.maxAuthFailureAttempts {
@@ -524,13 +587,7 @@ func (m *WsConnectionManager) scheduleReconnect() {
 
 		m.reconnectTimer = time.AfterFunc(
 			time.Duration(delay)*time.Millisecond,
-			func() {
-				m.reconnectTimer = nil
-				if m.isManualClose {
-					return
-				}
-				m.Connect()
-			},
+			m.reconnectTimerFired,
 		)
 	} else {
 		// 连接断开场景（网络异常、心跳超时等）
@@ -555,14 +612,27 @@ func (m *WsConnectionManager) scheduleReconnect() {
 
 		m.reconnectTimer = time.AfterFunc(
 			time.Duration(delay)*time.Millisecond,
-			func() {
-				m.reconnectTimer = nil
-				if m.isManualClose {
-					return
-				}
-				m.Connect()
-			},
+			m.reconnectTimerFired,
 		)
+	}
+}
+
+// reconnectTimerFired 重连定时器到期的公共入口
+func (m *WsConnectionManager) reconnectTimerFired() {
+	m.stopReconnectTimer()
+	if m.isManualClosed() {
+		return
+	}
+	m.reconnect()
+}
+
+// stopReconnectTimer 取消挂起的重连定时器
+func (m *WsConnectionManager) stopReconnectTimer() {
+	m.wsMu.Lock()
+	defer m.wsMu.Unlock()
+	if m.reconnectTimer != nil {
+		m.reconnectTimer.Stop()
+		m.reconnectTimer = nil
 	}
 }
 
@@ -579,9 +649,17 @@ func (m *WsConnectionManager) sendFrame(frame WsFrame) {
 		return
 	}
 
-	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	if err := m.writeMessage(conn, data); err != nil {
 		m.logger.Error("Failed to send frame: %s", err.Error())
 	}
+}
+
+// writeMessage 在 writeMu 保护下向连接写入一个文本帧。
+// gorilla 并发写不安全（beginMessage/endMessage 跨 goroutine 竞争），所有写必须经此串行化。
+func (m *WsConnectionManager) writeMessage(conn *websocket.Conn, data []byte) error {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	return conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // Send 发送数据帧
@@ -596,7 +674,7 @@ func (m *WsConnectionManager) Send(frame WsFrame) error {
 		return err
 	}
 
-	return conn.WriteMessage(websocket.TextMessage, data)
+	return m.writeMessage(conn, data)
 }
 
 // SendReply 通过 WebSocket 通道发送回复消息
@@ -720,7 +798,7 @@ func (m *WsConnectionManager) addPendingAck(reqID string, resolve func(*WsFrame)
 	seq := atomic.AddUint64(&m.pendingAckSeq, 1)
 
 	timer := time.AfterFunc(
-		time.Duration(replyAckTimeout)*time.Millisecond,
+		time.Duration(replyAckTimeout.Load())*time.Millisecond,
 		func() {
 			m.handleReplyAckTimeout(reqID, seq)
 		},
@@ -796,7 +874,7 @@ func (m *WsConnectionManager) handleReplyAckTimeout(reqID string, seq uint64) {
 	delete(m.pendingAcks, reqID)
 	m.pendingAcksMu.Unlock()
 
-	m.logger.Warn("Reply ack timeout (%dms) for reqId: %s", replyAckTimeout, reqID)
+	m.logger.Warn("Reply ack timeout (%dms) for reqId: %s", replyAckTimeout.Load(), reqID)
 
 	// 从队列中移除
 	m.replyQueuesMu.Lock()
@@ -808,7 +886,7 @@ func (m *WsConnectionManager) handleReplyAckTimeout(reqID string, seq uint64) {
 	}
 	m.replyQueuesMu.Unlock()
 
-	pending.reject(fmt.Errorf("reply ack timeout (%dms) for reqId: %s", replyAckTimeout, reqID))
+	pending.reject(fmt.Errorf("reply ack timeout (%dms) for reqId: %s", replyAckTimeout.Load(), reqID))
 
 	// 继续处理队列中的下一条
 	m.processReplyQueue(reqID)
@@ -844,17 +922,12 @@ func (m *WsConnectionManager) clearPendingMessages(reason string) {
 
 // Disconnect 断开连接
 func (m *WsConnectionManager) Disconnect() {
-	m.isManualClose = true
-	m.cancel()
-
+	m.setManualClosed(true)
 	m.stopHeartbeat()
 	m.clearPendingMessages("Connection manually closed")
 
 	// 取消挂起的重连定时器
-	if m.reconnectTimer != nil {
-		m.reconnectTimer.Stop()
-		m.reconnectTimer = nil
-	}
+	m.stopReconnectTimer()
 
 	m.closeConn()
 
@@ -883,6 +956,27 @@ func (m *WsConnectionManager) closeConn() {
 		m.ws = nil
 	}
 	m.wsMu.Unlock()
+}
+
+// setManualClosed 设置手动关闭标志。manual=false 表示一次全新的连接生命周期
+// （由 Connect 调用），此时重连相关的历史状态一并复位。
+func (m *WsConnectionManager) setManualClosed(manual bool) {
+	m.wsMu.Lock()
+	m.isManualClose = manual
+	if !manual {
+		m.lastCloseWasAuthFailure = false
+		m.reconnectAttempts = 0
+		m.authFailureAttempts = 0
+		m.missedPongCount.Store(0)
+	}
+	m.wsMu.Unlock()
+}
+
+// isManualClosed 返回是否处于"手动关闭/被踢下线"状态
+func (m *WsConnectionManager) isManualClosed() bool {
+	m.wsMu.RLock()
+	defer m.wsMu.RUnlock()
+	return m.isManualClose
 }
 
 // IsConnected 获取当前连接状态
