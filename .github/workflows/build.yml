@@ -1,4 +1,4 @@
-name: Test
+name: CI
 
 permissions:
   contents: read
@@ -16,7 +16,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: examples/basic/go.mod
+          go-version-file: go.mod
           cache-dependency-path: "**/go.sum"
+      # Three modules (library + two examples): every target fans out over
+      # GO_MOD_DIRS, so each go.mod is checked as a consumer sees it.
+      - name: Check dependencies
+        run: make tidy-check
+      - name: Build
+        run: make build
       - name: Test
         run: make test

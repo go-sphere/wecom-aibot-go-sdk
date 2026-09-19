@@ -10,7 +10,7 @@ DIRECT_ORIGIN := GOPRIVATE=github.com/go-sphere/*
 
 .DEFAULT_GOAL := check
 
-.PHONY: deps-update tidy fmt test lint check
+.PHONY: deps-update tidy tidy-check fmt build test lint check
 
 deps-update:
 	@set -eu; \
@@ -30,12 +30,30 @@ tidy:
 		( cd "$$dir" && GOWORK=off $(GO) mod tidy ); \
 	done
 
+# Non-mutating counterpart of tidy, for CI: fails if any module's go.mod/go.sum
+# is not what a consumer would resolve.
+tidy-check:
+	@set -eu; \
+	for dir in $(GO_MOD_DIRS); do \
+		echo "==> checking dependencies in $$dir"; \
+		( cd "$$dir" && GOWORK=off $(GO) mod tidy -diff ); \
+	done
+
 fmt:
 	@set -eu; \
 	for dir in $(GO_MOD_DIRS); do \
 		echo "==> formatting $$dir"; \
 		( cd "$$dir" && $(GO) fmt ./... && \
 		  $(GOLANGCI_LINT) fmt --no-config --enable gofmt --enable goimports ); \
+	done
+
+# -o /dev/null: the examples are main packages, and compiling them must not
+# drop binaries into the tree.
+build:
+	@set -eu; \
+	for dir in $(GO_MOD_DIRS); do \
+		echo "==> building $$dir"; \
+		( cd "$$dir" && $(GO) build -o /dev/null ./... ); \
 	done
 
 test:
@@ -55,11 +73,6 @@ lint:
 		  $(GOLANGCI_LINT) run --no-config ); \
 	done
 
-check:
-	@set -eu; \
-	for dir in $(GO_MOD_DIRS); do \
-		echo "==> checking dependencies in $$dir"; \
-		( cd "$$dir" && GOWORK=off $(GO) mod tidy -diff ); \
-	done
+check: tidy-check
 	$(MAKE) lint
 	$(MAKE) test
