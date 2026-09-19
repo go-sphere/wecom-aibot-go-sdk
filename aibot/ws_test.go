@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -231,7 +232,9 @@ func TestHeartbeatPeriodic(t *testing.T) {
 	mc := <-connCh
 	authOK(t, mc)
 
-	// 认证成功后应周期性收到心跳帧
+	// 认证成功后应周期性收到心跳帧。
+	// 间隔以帧内 ReqID 携带的客户端发送时间为准，而非服务端读到的时刻：
+	// 读循环被调度延迟后会一次排空 socket 缓冲，用接收时刻会得到虚假的短间隔。
 	seen := 0
 	var last time.Time
 	deadline := time.Now().Add(3 * time.Second)
@@ -240,18 +243,36 @@ func TestHeartbeatPeriodic(t *testing.T) {
 		if frame.Cmd != WsCmd.HEARTBEAT {
 			continue // 忽略其他帧（如重复认证），只统计心跳
 		}
+		sent, ok := heartbeatSentAt(frame)
+		if !ok {
+			t.Fatalf("heartbeat ReqID missing send timestamp: %q", frame.Headers.ReqID)
+		}
 		if !last.IsZero() {
-			interval := time.Since(last)
+			interval := sent.Sub(last)
 			if interval < time.Duration(mgr.heartbeatInterval)*time.Millisecond/3 {
 				t.Fatalf("heartbeat interval too short: %v", interval)
 			}
 		}
-		last = time.Now()
+		last = sent
 		seen++
 	}
 	if seen < 2 {
 		t.Fatalf("expected periodic heartbeats, got %d", seen)
 	}
+}
+
+// heartbeatSentAt 解析心跳帧 ReqID 中的客户端发送时间。
+// ReqID 形如 "<cmd>_<unixNano>_<randHex>"（见 generateReqId）。
+func heartbeatSentAt(frame WsFrame) (time.Time, bool) {
+	parts := strings.Split(frame.Headers.ReqID, "_")
+	if len(parts) < 3 {
+		return time.Time{}, false
+	}
+	ns, err := strconv.ParseInt(parts[len(parts)-2], 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(0, ns), true
 }
 
 // TestHeartbeatMissingPongTriggersReconnect 验证：服务端不响应心跳时，
