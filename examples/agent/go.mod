@@ -5,7 +5,7 @@ go 1.26.8
 replace github.com/go-sphere/wecom-aibot-go-sdk => ../..
 
 require (
-	github.com/anthropics/anthropic-sdk-go v1.70.1
+	github.com/anthropics/anthropic-sdk-go v1.74.0
 	github.com/go-sphere/wecom-aibot-go-sdk v0.0.0-20260325085413-090d8d7b0477
 )
 
@@ -21,5 +21,5 @@ require (
 	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/tidwall/sjson v1.2.5 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.6 // indirect
-	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 )
