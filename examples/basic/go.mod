@@ -1,4 +1,4 @@
-module github.com/go-sphere/wecom-aibot-go-sdk/aibot/example/basic
+module github.com/go-sphere/wecom-aibot-go-sdk/examples/basic
 
 go 1.26.8
 

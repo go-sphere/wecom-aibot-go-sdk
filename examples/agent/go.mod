@@ -1,4 +1,4 @@
-module github.com/go-sphere/wecom-aibot-go-sdk/aibot/example/agent
+module github.com/go-sphere/wecom-aibot-go-sdk/examples/agent
 
 go 1.26.8
 
