@@ -9,6 +9,7 @@ import (
 )
 
 // Logger 日志接口
+// format 与 v 遵循 fmt.Sprintf 语义。SDK 会从多个协程并发调用，实现必须并发安全。
 type Logger interface {
 	Debug(format string, v ...interface{})
 	Info(format string, v ...interface{})
@@ -17,6 +18,7 @@ type Logger interface {
 }
 
 // DefaultLogger 默认日志实现
+// 将带级别与时间戳的日志写到标准输出，可并发使用。通过 NewDefaultLogger 创建，零值不可用。
 type DefaultLogger struct {
 	logger *log.Logger
 	mu     sync.Mutex
@@ -62,6 +64,8 @@ func (l *DefaultLogger) log(level, format string, v ...interface{}) {
 // ============================================================
 
 // LoggerFunc 函数式日志适配器
+// level 为 "DEBUG"、"INFO"、"WARN" 或 "ERROR"。函数可能被并发调用。
+// 传入空函数即可关闭 SDK 日志。
 type LoggerFunc func(level string, format string, v ...interface{})
 
 // Debug 调试级别日志
@@ -84,7 +88,7 @@ func (f LoggerFunc) Error(format string, v ...interface{}) {
 	f("ERROR", format, v...)
 }
 
-// NewLoggerFunc 创建函数式日志适配器
+// NewLoggerFunc 创建函数式日志适配器，等价于 LoggerFunc(fn)。
 func NewLoggerFunc(fn func(level, format string, v ...interface{})) Logger {
 	return LoggerFunc(fn)
 }

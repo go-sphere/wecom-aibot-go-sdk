@@ -7,29 +7,36 @@ import (
 	"sync"
 )
 
-// ErrReplySkipped 非阻塞流式回复被跳过（上一条同 reqId 消息仍在等待 ack）
+// ErrReplySkipped 非阻塞流式回复被跳过（上一条同 reqId 消息仍在等待 ack）。
+// 由 WSClient.ReplyStreamNonBlocking 原样返回，可用 errors.Is 判断；此时没有发送任何数据。
 var ErrReplySkipped = errors.New("reply skipped: previous message still pending ack")
 
 // ============================================================================
 // 事件回调类型定义
 // ============================================================================
 
-// MessageHandlerFunc 消息处理函数
+// MessageHandlerFunc 消息处理函数。
+// frame 为收到的回调帧，可传给 ParseMessageBody 解析，或作为 Reply 系列方法的参数。
+// 函数在连接的读协程上同步执行，执行期间不会处理后续帧；阻塞操作（含 Reply 系列）
+// 应放到新协程中执行。
 type MessageHandlerFunc func(frame *WsFrame)
 
-// EventHandlerFunc 事件处理函数
+// EventHandlerFunc 事件处理函数。
+// 执行约束与 MessageHandlerFunc 相同；事件详情在 EventMessage.Event 中。
 type EventHandlerFunc func(frame *WsFrame)
 
-// ConnectionHandlerFunc 连接状态处理函数
+// ConnectionHandlerFunc 连接状态处理函数，用于 OnConnected 与 OnAuthenticated。
 type ConnectionHandlerFunc func()
 
-// ReconnectHandlerFunc 重连处理函数
+// ReconnectHandlerFunc 重连处理函数。attempt 为当前重连序号，从 1 开始；认证失败重试与断线重连分别计数。
 type ReconnectHandlerFunc func(attempt int)
 
-// ErrorHandlerFunc 错误处理函数
+// ErrorHandlerFunc 错误处理函数。
+// 可能收到拨号错误、认证失败错误，以及重试耗尽时的 *WSAuthFailureError 或
+// *WSReconnectExhaustedError（可用 errors.As 判断，此时 SDK 已停止自动重连）。
 type ErrorHandlerFunc func(err error)
 
-// DisconnectHandlerFunc 断开连接处理函数
+// DisconnectHandlerFunc 断开连接处理函数。reason 为人类可读的断开原因，不是稳定的错误码。
 type DisconnectHandlerFunc func(reason string)
 
 // ============================================================================
@@ -38,6 +45,8 @@ type DisconnectHandlerFunc func(reason string)
 
 // WSClient 企业微信智能机器人客户端
 // 使用 WebSocket 长连接通道与企业微信通信
+//
+// 通过 NewWSClient 创建，零值不可用。回调注册、Connect、Disconnect 与各发送方法可从多个协程并发调用。连接由 WSClient 持有，调用方负责在退出时调用 Disconnect。
 type WSClient struct {
 	options   RequiredWSClientOptions
 	apiClient *WeComApiClient
@@ -74,6 +83,10 @@ type WSClient struct {
 }
 
 // NewWSClient 创建 WSClient 实例
+//
+// 只构造客户端，不发起网络连接，也不校验凭证；凭证错误在 Connect 后通过 OnError 报告。
+// options 中为零值的字段使用 DefaultWSClientOptions 中的默认值；Logger 为 nil 时使用
+// NewDefaultLogger（输出到标准输出）。
 func NewWSClient(options WSClientOptions) *WSClient {
 	// 设置默认值
 	opts := DefaultWSClientOptions
@@ -204,8 +217,12 @@ func (c *WSClient) setupWsEvents() {
 // ============================================================================
 
 // Connect 建立 WebSocket 长连接
-// SDK 使用内置默认地址建立连接，连接成功后自动发送认证帧（botId + secret）。
+// SDK 默认使用内置地址（可用 WSClientOptions.WSURL 覆盖）建立连接，连接成功后自动发送认证帧（botId + secret）。
 // 连接断开或认证失败重试耗尽后（started 已被复位），可再次调用 Connect() 重新发起连接。
+//
+// Connect 不等待建连完成：拨号在后台协程中进行，结果通过 OnConnected、OnAuthenticated 与 OnError 回调通知。客户端已启动时再次调用只记录警告并返回。
+// 网络断开或心跳超时后会按指数退避自动重连；服务端因新连接推送 disconnected_event
+// 时不会自动重连。返回值为 c 本身，便于链式调用。
 func (c *WSClient) Connect() *WSClient {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -224,6 +241,8 @@ func (c *WSClient) Connect() *WSClient {
 }
 
 // Disconnect 断开 WebSocket 连接
+//
+// 关闭当前连接、停止心跳并取消挂起的自动重连；正在等待回执或排队中的回复立即以错误返回。客户端未启动时只记录警告。Disconnect 不等待后台协程退出；之后可再次调用 Connect 重新连接。
 func (c *WSClient) Disconnect() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -240,6 +259,8 @@ func (c *WSClient) Disconnect() {
 }
 
 // IsConnected 获取当前连接状态
+//
+// 返回 true 表示 WebSocket 已建立，不代表认证已成功；认证成功请以 OnAuthenticated 为准。
 func (c *WSClient) IsConnected() bool {
 	return c.wsManager.IsConnected()
 }
@@ -249,6 +270,9 @@ func (c *WSClient) IsConnected() bool {
 // ============================================================================
 
 // OnMessage 收到消息（所有类型）
+//
+// 每条消息回调先触发 OnMessage，再触发对应类型的 OnMessageText 等回调。
+// 再次调用会替换之前的回调，传 nil 取消。回调执行约束见 MessageHandlerFunc。
 func (c *WSClient) OnMessage(handler MessageHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -298,6 +322,9 @@ func (c *WSClient) OnMessageVideo(handler MessageHandlerFunc) {
 }
 
 // OnEvent 收到事件回调（所有事件类型）
+//
+// 每个事件先触发 OnEvent，再触发对应类型的 OnEventEnterChat 等回调。
+// 再次调用会替换之前的回调，传 nil 取消。
 func (c *WSClient) OnEvent(handler EventHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -326,6 +353,8 @@ func (c *WSClient) OnEventFeedbackEvent(handler EventHandlerFunc) {
 }
 
 // OnEventDisconnected 收到连接断开事件（有新连接建立，服务端主动断开当前旧连接）
+//
+// 收到该事件后 SDK 关闭旧连接、不再自动重连，并随后触发 OnDisconnected。
 func (c *WSClient) OnEventDisconnected(handler EventHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -333,6 +362,8 @@ func (c *WSClient) OnEventDisconnected(handler EventHandlerFunc) {
 }
 
 // OnConnected 连接建立
+//
+// 在每次（含自动重连）WebSocket 建立、认证帧发出后调用，此时认证尚未完成。
 func (c *WSClient) OnConnected(handler ConnectionHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -340,6 +371,8 @@ func (c *WSClient) OnConnected(handler ConnectionHandlerFunc) {
 }
 
 // OnAuthenticated 认证成功
+//
+// 每次（含自动重连）认证成功后调用，此后才能收到消息回调。
 func (c *WSClient) OnAuthenticated(handler ConnectionHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -347,6 +380,9 @@ func (c *WSClient) OnAuthenticated(handler ConnectionHandlerFunc) {
 }
 
 // OnDisconnected 连接断开
+//
+// 连接因读错误、心跳超时、认证失败或服务端踢下线而断开时调用；调用 Disconnect
+// 主动断开时不调用。
 func (c *WSClient) OnDisconnected(handler DisconnectHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -354,6 +390,9 @@ func (c *WSClient) OnDisconnected(handler DisconnectHandlerFunc) {
 }
 
 // OnReconnecting 重连中
+//
+// 在安排下一次重连时调用。回调可能在 SDK 持有内部连接锁时执行，回调内不要同步调用
+// Connect、Disconnect 或 IsConnected。
 func (c *WSClient) OnReconnecting(handler ReconnectHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -361,6 +400,8 @@ func (c *WSClient) OnReconnecting(handler ReconnectHandlerFunc) {
 }
 
 // OnError 发生错误
+//
+// 错误类型见 ErrorHandlerFunc。回调可能在 SDK 持有内部连接锁时执行，回调内不要同步调用 Connect、Disconnect 或 IsConnected；需要重新连接时请在新协程中调用 Connect。
 func (c *WSClient) OnError(handler ErrorHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -477,72 +518,85 @@ func (c *WSClient) errorHandler() ErrorHandlerFunc {
 // FrameEmitter 实现
 // ============================================================================
 
+// EmitMessage 实现 FrameEmitter：调用 OnMessage 注册的回调（未注册时忽略）。
+// Emit 系列方法供 MessageHandler 分发帧使用，应用代码通常无需直接调用。
 func (c *WSClient) EmitMessage(frame *WsFrame) {
 	if h := c.messageHandler_(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitMessageText 实现 FrameEmitter：调用 OnMessageText 注册的回调。
 func (c *WSClient) EmitMessageText(frame *WsFrame) {
 	if h := c.messageTextHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitMessageImage 实现 FrameEmitter：调用 OnMessageImage 注册的回调。
 func (c *WSClient) EmitMessageImage(frame *WsFrame) {
 	if h := c.messageImageHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitMessageMixed 实现 FrameEmitter：调用 OnMessageMixed 注册的回调。
 func (c *WSClient) EmitMessageMixed(frame *WsFrame) {
 	if h := c.messageMixedHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitMessageVoice 实现 FrameEmitter：调用 OnMessageVoice 注册的回调。
 func (c *WSClient) EmitMessageVoice(frame *WsFrame) {
 	if h := c.messageVoiceHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitMessageFile 实现 FrameEmitter：调用 OnMessageFile 注册的回调。
 func (c *WSClient) EmitMessageFile(frame *WsFrame) {
 	if h := c.messageFileHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitMessageVideo 实现 FrameEmitter：调用 OnMessageVideo 注册的回调。
 func (c *WSClient) EmitMessageVideo(frame *WsFrame) {
 	if h := c.messageVideoHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitEvent 实现 FrameEmitter：调用 OnEvent 注册的回调。
 func (c *WSClient) EmitEvent(frame *WsFrame) {
 	if h := c.eventHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitEventEnterChat 实现 FrameEmitter：调用 OnEventEnterChat 注册的回调。
 func (c *WSClient) EmitEventEnterChat(frame *WsFrame) {
 	if h := c.eventEnterChatHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitEventTemplateCardEvent 实现 FrameEmitter：调用 OnEventTemplateCardEvent 注册的回调。
 func (c *WSClient) EmitEventTemplateCardEvent(frame *WsFrame) {
 	if h := c.eventTemplateCardEventHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitEventFeedbackEvent 实现 FrameEmitter：调用 OnEventFeedbackEvent 注册的回调。
 func (c *WSClient) EmitEventFeedbackEvent(frame *WsFrame) {
 	if h := c.eventFeedbackEventHandler(); h != nil {
 		h(frame)
 	}
 }
 
+// EmitEventDisconnected 实现 FrameEmitter：调用 OnEventDisconnected 注册的回调。
 func (c *WSClient) EmitEventDisconnected(frame *WsFrame) {
 	if h := c.eventDisconnectedHandler(); h != nil {
 		h(frame)
@@ -554,6 +608,11 @@ func (c *WSClient) EmitEventDisconnected(frame *WsFrame) {
 // ============================================================================
 
 // Reply 通过 WebSocket 通道发送回复消息（通用方法）
+//
+// frame 必须是收到的回调帧（不能为 nil），回复使用其 req_id；body 序列化为 JSON 作为帧的 body；cmd 为空时使用 WsCmd.RESPONSE。同一 req_id 的回复按调用顺序串行发送，Reply 阻塞直到服务端回执、5 秒回执超时、连接断开或调用 Disconnect，排队等待的时间不计入超时。成功时返回回执帧。
+//
+// 以下情况返回错误：req_id 为空、body 无法序列化、连接未建立、该 req_id 排队数超过
+// MaxReplyQueueSize、回执超时、回执 errcode 非 0（错误信息包含 errcode），以及连接断开导致回复被取消。不要在消息回调中同步调用，见 MessageHandlerFunc。
 func (c *WSClient) Reply(frame *WsFrame, body interface{}, cmd string) (*WsFrame, error) {
 	reqID := frame.Headers.ReqID
 	if reqID == "" {
@@ -564,6 +623,8 @@ func (c *WSClient) Reply(frame *WsFrame, body interface{}, cmd string) (*WsFrame
 }
 
 // HasPendingReplyAck 检查指定消息帧是否有未完成的 ack
+//
+// 只反映已发出、正在等待回执的回复，不包括仍在排队的回复。frame 不能为 nil。
 //
 // 用于流式场景：调用方可据此决定是否跳过当前中间帧，避免排队积压。
 func (c *WSClient) HasPendingReplyAck(frame *WsFrame) bool {
@@ -585,6 +646,10 @@ func (c *WSClient) ReplyStreamNonBlocking(frame *WsFrame, streamID, content stri
 }
 
 // ReplyStream 发送流式文本回复（便捷方法）
+//
+// 同一条流式消息的每次调用都使用相同的 streamID，content 为截至当前的完整内容
+// （支持 Markdown），最后一次传 finish=true 结束。msgItem 与 feedback 可为 nil。
+// 阻塞与错误语义同 Reply。
 func (c *WSClient) ReplyStream(frame *WsFrame, streamID, content string, finish bool, msgItem []ReplyMsgItem, feedback *ReplyFeedback) (*WsFrame, error) {
 	stream := StreamReplyBody{
 		Stream: struct {
@@ -611,6 +676,7 @@ func (c *WSClient) ReplyStream(frame *WsFrame, streamID, content string, finish 
 }
 
 // ReplyWelcome 发送欢迎语回复
+// body 可用 CreateWelcomeReplyBody、WelcomeTextReplyBody 或 WelcomeTemplateCardReplyBody 构造。
 // 注意：此方法需要使用对应事件（如 enter_chat）的 req_id 才能调用
 // 收到事件回调后需在 5 秒内发送回复
 func (c *WSClient) ReplyWelcome(frame *WsFrame, body interface{}) (*WsFrame, error) {
@@ -618,6 +684,7 @@ func (c *WSClient) ReplyWelcome(frame *WsFrame, body interface{}) (*WsFrame, err
 }
 
 // ReplyTemplateCard 回复模板卡片消息
+// feedback 非 nil 时覆盖 templateCard.Feedback。阻塞与错误语义同 Reply。
 func (c *WSClient) ReplyTemplateCard(frame *WsFrame, templateCard TemplateCard, feedback *ReplyFeedback) (*WsFrame, error) {
 	card := templateCard
 	if feedback != nil {
@@ -633,6 +700,8 @@ func (c *WSClient) ReplyTemplateCard(frame *WsFrame, templateCard TemplateCard, 
 }
 
 // ReplyStreamWithCard 发送流式消息 + 模板卡片组合回复
+// options 中各字段均可为零值；TemplateCard 为 nil 时只发送流式部分，CardFeedback
+// 非 nil 时覆盖卡片的 Feedback。阻塞与错误语义同 Reply。
 func (c *WSClient) ReplyStreamWithCard(
 	frame *WsFrame,
 	streamID, content string,
@@ -675,6 +744,7 @@ func (c *WSClient) ReplyStreamWithCard(
 }
 
 // UpdateTemplateCard 更新模板卡片
+// userIDs 为空时不携带 userids 字段。阻塞与错误语义同 Reply。
 // 注意：此方法需要使用对应事件（template_card_event）的 req_id 才能调用
 // 收到事件回调后需在 5 秒内发送回复
 func (c *WSClient) UpdateTemplateCard(frame *WsFrame, templateCard TemplateCard, userIDs []string) (*WsFrame, error) {
@@ -696,6 +766,8 @@ func (c *WSClient) UpdateTemplateCard(frame *WsFrame, templateCard TemplateCard,
 
 // SendMessage 主动发送消息
 // 向指定会话（单聊或群聊）主动推送消息，无需依赖收到的回调帧
+//
+// body 必须能序列化为 JSON 对象（map、struct 或其指针），否则返回错误且不发送；chatID 会写入 body 的 chatid 字段。每次调用使用新的 req_id，阻塞直到回执、5 秒回执超时或连接断开，错误语义同 Reply。
 func (c *WSClient) SendMessage(chatID string, body interface{}) (*WsFrame, error) {
 	reqID := GenerateReqId(WsCmd.SEND_MSG)
 
@@ -733,6 +805,7 @@ func objectMap(v interface{}) (map[string]interface{}, error) {
 }
 
 // SendMarkdown 发送 Markdown 消息
+// 是 SendMessage 的便捷封装，阻塞与错误语义相同。
 func (c *WSClient) SendMarkdown(chatID, content string) (*WsFrame, error) {
 	body := SendMarkdownMsgBody{
 		ChatID: chatID,
@@ -748,6 +821,7 @@ func (c *WSClient) SendMarkdown(chatID, content string) (*WsFrame, error) {
 }
 
 // SendTemplateCard 发送模板卡片消息
+// 是 SendMessage 的便捷封装，阻塞与错误语义相同。
 func (c *WSClient) SendTemplateCard(chatID string, templateCard TemplateCard) (*WsFrame, error) {
 	body := SendTemplateCardMsgBody{
 		ChatID:       chatID,
@@ -766,6 +840,8 @@ func (c *WSClient) SendTemplateCard(chatID string, templateCard TemplateCard) (*
 //
 // 通过 WebSocket 长连接执行分片上传：init → chunk × N → finish
 // 单个分片不超过 512KB（Base64 编码前），最多 100 个分片。
+//
+// fileBuffer 超过 100 个分片时直接返回错误。各步骤串行执行、逐条等待回执，耗时随分片数增长；任一步失败即返回包装后的错误（%w），已上传的分片不会被清理。成功时返回的 MediaID 可传给 ReplyMedia 或 SendMediaMessage。需要已建立的连接，不要在消息回调中同步调用。
 func (c *WSClient) UploadMedia(fileBuffer []byte, options UploadMediaOptions) (*UploadMediaFinishResult, error) {
 	totalSize := len(fileBuffer)
 
@@ -853,6 +929,8 @@ func (c *WSClient) UploadMedia(fileBuffer []byte, options UploadMediaOptions) (*
 // ReplyMedia 被动回复媒体消息（便捷方法）
 //
 // 通过 aibot_respond_msg 被动回复通道发送媒体消息（file/image/voice/video）
+//
+// mediaID 来自 UploadMedia；videoOptions 仅在 mediaType 为 WeComMediaTypeVideo 时使用，可为 nil。阻塞与错误语义同 Reply。
 func (c *WSClient) ReplyMedia(frame *WsFrame, mediaType WeComMediaType, mediaID string, videoOptions *VideoMediaContent) (*WsFrame, error) {
 	body := buildMediaMsgBody(mediaType, mediaID, videoOptions)
 	return c.Reply(frame, body, "")
@@ -861,6 +939,8 @@ func (c *WSClient) ReplyMedia(frame *WsFrame, mediaType WeComMediaType, mediaID 
 // SendMediaMessage 主动发送媒体消息（便捷方法）
 //
 // 通过 aibot_send_msg 主动推送通道发送媒体消息
+//
+// 参数含义同 ReplyMedia，阻塞与错误语义同 SendMessage。
 func (c *WSClient) SendMediaMessage(chatID string, mediaType WeComMediaType, mediaID string, videoOptions *VideoMediaContent) (*WsFrame, error) {
 	body := buildMediaMsgBody(mediaType, mediaID, videoOptions)
 	return c.SendMessage(chatID, body)
@@ -894,6 +974,9 @@ func buildMediaMsgBody(mediaType WeComMediaType, mediaID string, videoOptions *V
 // ============================================================================
 
 // DownloadFile 下载文件并使用 AES 密钥解密
+//
+// fileURL 与 aesKey 来自图片、文件、视频等消息体（如 ImageContent.URL 与
+// ImageContent.AesKey）。通过 HTTP GET 下载，超时为 WSClientOptions.RequestTimeout，不使用 WebSocket 连接。aesKey 为空时返回未解密的原始数据。返回值依次为文件内容、从 Content-Disposition 解析出的文件名（可能为空）与错误；非 200 响应、下载失败或解密失败时返回错误。
 func (c *WSClient) DownloadFile(fileURL, aesKey string) ([]byte, string, error) {
 	c.logger.Info("Downloading and decrypting file...")
 
@@ -928,6 +1011,7 @@ func (c *WSClient) DownloadFile(fileURL, aesKey string) ([]byte, string, error) 
 // ============================================================================
 
 // GetAPI 获取 API 客户端实例（供高级用途使用，如文件下载）
+// 返回的实例由 WSClient 持有，可并发使用。
 func (c *WSClient) GetAPI() *WeComApiClient {
 	return c.apiClient
 }
@@ -937,6 +1021,7 @@ func (c *WSClient) GetAPI() *WeComApiClient {
 // ============================================================================
 
 // GetMsgID 从 frame 中提取 msgid
+// frame 为 nil、body 为空、无法解析或缺少该字段时返回空字符串。
 func GetMsgID(frame *WsFrame) string {
 	if frame == nil || frame.Body == nil {
 		return ""
@@ -953,7 +1038,7 @@ func GetMsgID(frame *WsFrame) string {
 	return ""
 }
 
-// GetReqID 从 frame 中提取 req_id
+// GetReqID 从 frame 中提取 req_id，frame 为 nil 时返回空字符串。
 func GetReqID(frame *WsFrame) string {
 	if frame == nil {
 		return ""
@@ -961,7 +1046,8 @@ func GetReqID(frame *WsFrame) string {
 	return frame.Headers.ReqID
 }
 
-// GetMsgType 从 frame 中提取 msgtype
+// GetMsgType 从 frame 中提取 msgtype（如 "text"、"image"、"event"）
+// frame 为 nil、body 为空、无法解析或缺少该字段时返回空字符串。
 func GetMsgType(frame *WsFrame) string {
 	if frame == nil || frame.Body == nil {
 		return ""
@@ -978,7 +1064,8 @@ func GetMsgType(frame *WsFrame) string {
 	return ""
 }
 
-// GetEventType 从 frame 中提取 eventtype
+// GetEventType 从 frame 中提取 event.eventtype（如 "enter_chat"）
+// 非事件帧或无法解析时返回空字符串。
 func GetEventType(frame *WsFrame) string {
 	if frame == nil || frame.Body == nil {
 		return ""
@@ -1006,6 +1093,9 @@ func GetEventType(frame *WsFrame) string {
 }
 
 // ParseMessageBody 解析消息体为指定类型
+//
+// v 为指向目标结构的指针，如 *TextMessage、*ImageMessage 或 *EventMessage。
+// frame 或 body 为 nil 时返回错误，JSON 解码错误原样返回。
 func ParseMessageBody(frame *WsFrame, v interface{}) error {
 	if frame == nil || frame.Body == nil {
 		return fmt.Errorf("frame or body is nil")
@@ -1017,7 +1107,7 @@ func ParseMessageBody(frame *WsFrame, v interface{}) error {
 // 包级别便捷函数
 // ============================================================================
 
-// CreateTextReplyBody 创建文本回复消息体
+// CreateTextReplyBody 创建文本回复消息体（msgtype 为 text），可用于 Reply、ReplyWelcome 或 SendMessage。
 func CreateTextReplyBody(content string) map[string]interface{} {
 	return map[string]interface{}{
 		"msgtype": "text",
@@ -1027,7 +1117,7 @@ func CreateTextReplyBody(content string) map[string]interface{} {
 	}
 }
 
-// CreateMarkdownReplyBody 创建 Markdown 回复消息体
+// CreateMarkdownReplyBody 创建 Markdown 回复消息体（msgtype 为 markdown），可用于 Reply 或 SendMessage。
 func CreateMarkdownReplyBody(content string) map[string]interface{} {
 	return map[string]interface{}{
 		"msgtype": "markdown",
@@ -1037,7 +1127,7 @@ func CreateMarkdownReplyBody(content string) map[string]interface{} {
 	}
 }
 
-// CreateWelcomeReplyBody 创建欢迎语回复消息体
+// CreateWelcomeReplyBody 创建欢迎语回复消息体（文本类型），用于 ReplyWelcome。
 func CreateWelcomeReplyBody(content string) map[string]interface{} {
 	return map[string]interface{}{
 		"msgtype": "text",
@@ -1047,7 +1137,8 @@ func CreateWelcomeReplyBody(content string) map[string]interface{} {
 	}
 }
 
-// CreateStreamReplyBody 创建流式回复消息体
+// CreateStreamReplyBody 创建流式回复消息体，可传给 Reply；效果与 ReplyStream 相同。
+// msgItem 为空、feedback 为 nil 时省略对应字段。
 func CreateStreamReplyBody(streamID, content string, finish bool, msgItem []ReplyMsgItem, feedback *ReplyFeedback) map[string]interface{} {
 	stream := map[string]interface{}{
 		"id":      streamID,

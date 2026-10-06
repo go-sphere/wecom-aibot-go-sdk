@@ -20,6 +20,7 @@ func generateReqId(cmd string) string {
 }
 
 // GenerateReqId 生成请求 ID（公开方法）
+// 格式为 {cmd}_{纳秒时间戳}_{8 位随机十六进制}，可并发调用。
 func GenerateReqId(cmd string) string {
 	return generateReqId(cmd)
 }
@@ -32,6 +33,7 @@ func generateRandomString(length int) string {
 }
 
 // GenerateRandomString 生成随机字符串（公开方法）
+// 返回 length 个随机十六进制字符；length 为负数时 panic。
 func GenerateRandomString(length int) string {
 	return generateRandomString(length)
 }

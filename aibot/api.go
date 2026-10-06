@@ -13,18 +13,20 @@ import (
 
 // FileResult 文件下载结果
 type FileResult struct {
-	Buffer   []byte
-	Filename string
+	Buffer   []byte // 响应体原始数据（未解密）
+	Filename string // 从 Content-Disposition 解析出的文件名，可能为空
 }
 
 // WeComApiClient 企业微信 API 客户端
 // 仅负责文件下载等 HTTP 辅助功能，消息收发均走 WebSocket 通道
+// 可并发使用。通常通过 WSClient.GetAPI 获取。
 type WeComApiClient struct {
 	httpClient *http.Client
 	logger     Logger
 }
 
 // NewWeComApiClient 创建 API 客户端
+// timeout 为 HTTP 请求超时（毫秒），<= 0 时使用 10000；logger 不能为 nil。
 func NewWeComApiClient(logger Logger, timeout int) *WeComApiClient {
 	if timeout <= 0 {
 		timeout = 10000
@@ -41,6 +43,8 @@ func NewWeComApiClient(logger Logger, timeout int) *WeComApiClient {
 }
 
 // DownloadFileRaw 下载文件（返回原始数据及文件名）
+//
+// 对 fileURL 发起 HTTP GET，不解密。请求失败、响应状态不是 200 或读取响应体失败时返回错误；成功时返回完整读入内存的响应体。加密文件可再用 DecryptFile 解密，或直接使用 WSClient.DownloadFile。
 func (c *WeComApiClient) DownloadFileRaw(fileURL string) (*FileResult, error) {
 	c.logger.Info("Downloading file...")
 
@@ -123,6 +127,7 @@ func parseFilename(contentDisposition string) string {
 }
 
 // GetFilenameFromURL 从 URL 解析文件名
+// 优先取路径的最后一段并做 URL 解码；URL 无法解析时返回空字符串。
 func GetFilenameFromURL(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
@@ -161,6 +166,7 @@ func GetFilenameFromURL(rawURL string) string {
 }
 
 // GetMimeType 获取文件的 MIME 类型
+// 按扩展名通过 mime.TypeByExtension 查询，未知扩展名返回空字符串。
 func GetMimeType(filename string) string {
 	ext := filepath.Ext(filename)
 	return mime.TypeByExtension(ext)

@@ -12,6 +12,9 @@ import (
 //	aesKey       - Base64 编码的 AES-256 密钥（43字符的 Base64 字符串，可能带或不带 padding）
 //
 // 返回解密后的文件数据
+//
+// IV 取密钥前 16 字节，并按 32 字节块去除 PKCS#7 填充。encryptedData 为空、aesKey
+// 为空或无效、密文长度不是 32 的倍数或填充无效时返回错误。不修改 encryptedData。
 func DecryptFile(encryptedData []byte, aesKey string) ([]byte, error) {
 	// 参数验证
 	if len(encryptedData) == 0 {

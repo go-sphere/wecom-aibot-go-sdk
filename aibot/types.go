@@ -14,6 +14,7 @@ import (
 // ============================================================================
 
 // WsCmd WebSocket 命令类型常量
+// 值对应协议中帧的 cmd 字段；虽然声明为变量，但不应修改。
 var WsCmd = struct {
 	// 开发者 → 企业微信
 	SUBSCRIBE           string // 认证订阅
@@ -43,8 +44,10 @@ var WsCmd = struct {
 	EVENT_CALLBACK:      "aibot_event_callback",
 }
 
-// MessageType 消息类型枚举
+// MessageType 消息类型枚举，对应消息回调 body 中的 msgtype。
 type MessageType string
+
+// 消息回调支持的 msgtype 取值。
 
 const (
 	MessageTypeText  MessageType = "text"
@@ -55,8 +58,10 @@ const (
 	MessageTypeVideo MessageType = "video"
 )
 
-// TemplateCardType 卡片类型枚举
+// TemplateCardType 卡片类型枚举，对应 TemplateCard.CardType。
 type TemplateCardType string
+
+// 模板卡片的 card_type 取值。
 
 const (
 	TemplateCardTypeTextNotice          TemplateCardType = "text_notice"
@@ -66,8 +71,10 @@ const (
 	TemplateCardTypeMultipleInteraction TemplateCardType = "multiple_interaction"
 )
 
-// EventType 事件类型枚举
+// EventType 事件类型枚举，对应事件回调 body 中的 event.eventtype。
 type EventType string
+
+// 事件回调支持的 eventtype 取值。
 
 const (
 	EventTypeEnterChat         EventType = "enter_chat"
@@ -81,6 +88,7 @@ const (
 // ============================================================================
 
 // WsFrame WebSocket 帧结构
+// 回调帧由 SDK 传给回调函数，Body 为原始 JSON，用 ParseMessageBody 解析；回调帧在回调返回后仍可安全地保留并用于异步回复，SDK 不会复用它。
 type WsFrame struct {
 	Cmd     string          `json:"cmd,omitempty"`     // 命令类型
 	Headers WsFrameHeaders  `json:"headers"`           // 请求头信息
@@ -154,6 +162,7 @@ type QuoteContent struct {
 }
 
 // BaseMessage 基础消息结构
+// ChatType 为 "single"（单聊）或 "group"（群聊）；ChatID 仅群聊时存在。
 type BaseMessage struct {
 	MsgID       string        `json:"msgid"`
 	AibotID     string        `json:"aibotid"`
@@ -202,7 +211,7 @@ type VideoMessage struct {
 	Video VideoContent `json:"video"`
 }
 
-// ReplyOptions 回复消息选项
+// ReplyOptions 回复消息选项（WSClient 的方法不使用此类型）
 type ReplyOptions struct {
 	MsgID  string `json:"msgid"`
 	ChatID string `json:"chatid"`
@@ -253,6 +262,7 @@ type DisconnectedEventData struct {
 }
 
 // EventMessage 事件回调消息结构
+// Event 保存原始事件 JSON，可再解析为 TemplateCardEventData、EnterChatEvent 等类型。
 type EventMessage struct {
 	MsgID      string          `json:"msgid"`
 	CreateTime int64           `json:"create_time"`
@@ -283,6 +293,7 @@ type ReplyFeedback struct {
 }
 
 // StreamReplyBody 流式回复消息体
+// 可传给 WSClient.Reply；通常直接使用 WSClient.ReplyStream。
 type StreamReplyBody struct {
 	MsgType string `json:"msgtype"` // 固定为 stream
 	Stream  struct {
@@ -354,8 +365,10 @@ type SendTemplateCardMsgBody struct {
 // 媒体消息相关类型
 // ============================================================================
 
-// WeComMediaType 企业微信媒体类型
+// WeComMediaType 企业微信媒体类型，用于 UploadMedia、ReplyMedia 与 SendMediaMessage。
 type WeComMediaType string
+
+// 支持的媒体类型。
 
 const (
 	WeComMediaTypeFile  WeComMediaType = "file"
@@ -385,7 +398,8 @@ type VideoMediaContent struct {
 	Description string `json:"description,omitempty"` // 不超过512字节
 }
 
-// UploadMediaOptions uploadMedia 方法选项
+// UploadMediaOptions UploadMedia 方法选项
+// Type 为媒体类型，Filename 为展示给用户的文件名。
 type UploadMediaOptions struct {
 	Type     WeComMediaType `json:"type"`
 	Filename string         `json:"filename"`
@@ -432,6 +446,7 @@ type UploadMediaFinishResult struct {
 type WeComTimestamp int64
 
 // UnmarshalJSON 兼容数字与字符串两种形式的秒级时间戳
+// null 与空字符串解析为 0；其他无法解析为整数的值返回错误。
 func (t *WeComTimestamp) UnmarshalJSON(data []byte) error {
 	text := strings.TrimSpace(string(data))
 	if text == "null" || text == `""` {
@@ -581,6 +596,7 @@ type TemplateCardCheckbox struct {
 }
 
 // TemplateCard 模板卡片结构
+// CardType 取 TemplateCardType 中的值，需要填写的字段取决于卡片类型，参见企业微信模板卡片文档；SDK 不在本地校验字段组合。
 type TemplateCard struct {
 	CardType          string                          `json:"card_type"`
 	Source            *TemplateCardSource             `json:"source,omitempty"`
@@ -609,23 +625,25 @@ type TemplateCard struct {
 // ============================================================================
 
 // WSClientOptions WSClient 配置选项
+// 除 BotID 与 Secret 外均可省略，零值表示使用 DefaultWSClientOptions 中的默认值。
+// 配置在 NewWSClient 时读取，之后修改不生效。
 type WSClientOptions struct {
-	BotID                  string            // 机器人 ID
-	Secret                 string            // 机器人 Secret
-	Scene                  *int              // 场景值（可选）
-	PlugVersion            string            // 插件版本号（可选）
-	ReconnectInterval      int               // 重连基础延迟（毫秒），默认 1000
-	MaxReconnectAttempts   int               // 连接断开时的最大重连次数，默认 10，-1 表示无限
-	MaxAuthFailureAttempts int               // 认证失败时的最大重试次数，默认 5，-1 表示无限
-	HeartbeatInterval      int               // 心跳间隔（毫秒），默认 30000
-	RequestTimeout         int               // 请求超时（毫秒），默认 10000
-	WSURL                  string            // 自定义 WebSocket 地址
-	WsDialer               *websocket.Dialer // 自定义 WebSocket Dialer（如 TLS 配置等）
-	MaxReplyQueueSize      int               // 单个 req_id 的回复队列最大长度，默认 500
-	Logger                 Logger            // 自定义日志
+	BotID                  string            // 机器人 ID（必填，NewWSClient 不校验）
+	Secret                 string            // 机器人 Secret（必填，NewWSClient 不校验）
+	Scene                  *int              // 场景值（可选），非 nil 时随认证帧发送
+	PlugVersion            string            // 插件版本号（可选），非空时随认证帧发送
+	ReconnectInterval      int               // 重连基础延迟（毫秒），默认 1000；按指数退避递增，上限 30 秒
+	MaxReconnectAttempts   int               // 连接断开时的最大重连次数，默认 10，负数（如 -1）表示无限
+	MaxAuthFailureAttempts int               // 认证失败时的最大重试次数，默认 5，负数（如 -1）表示无限
+	HeartbeatInterval      int               // 心跳间隔（毫秒），默认 30000；连续 2 次心跳无回执视为连接断开
+	RequestTimeout         int               // HTTP 请求（文件下载）超时（毫秒），默认 10000；不影响回复的 5 秒回执超时
+	WSURL                  string            // 自定义 WebSocket 地址，默认 wss://openws.work.weixin.qq.com
+	WsDialer               *websocket.Dialer // 自定义 WebSocket Dialer（如 TLS 配置等），nil 时使用零值 Dialer
+	MaxReplyQueueSize      int               // 单个 req_id 的回复队列最大长度，默认 500，超出时新回复直接返回错误
+	Logger                 Logger            // 自定义日志，nil 时使用 NewDefaultLogger；会被多个协程并发调用
 }
 
-// RequiredWSClientOptions 带默认值的配置
+// RequiredWSClientOptions 带默认值的配置，字段含义与单位同 WSClientOptions。
 type RequiredWSClientOptions struct {
 	ReconnectInterval      int
 	MaxReconnectAttempts   int
@@ -637,6 +655,7 @@ type RequiredWSClientOptions struct {
 }
 
 // DefaultWSClientOptions 默认配置值
+// NewWSClient 在创建时复制该值；修改它会影响之后创建的客户端，不影响已有客户端。
 var DefaultWSClientOptions = RequiredWSClientOptions{
 	ReconnectInterval:      1000,
 	MaxReconnectAttempts:   10,
@@ -652,19 +671,23 @@ var DefaultWSClientOptions = RequiredWSClientOptions{
 // ============================================================================
 
 // WSAuthFailureError 认证失败重试次数用尽错误
+// 通过 OnError 回调以 *WSAuthFailureError 报告，可用 errors.As 判断；此时 SDK 已停止自动重连，可再次调用 WSClient.Connect（不要在 OnError 回调中同步调用）。
 type WSAuthFailureError struct {
 	MaxAttempts int
 }
 
+// Error 返回包含最大重试次数的错误信息。
 func (e *WSAuthFailureError) Error() string {
 	return fmt.Sprintf("max auth failure attempts exceeded (%d)", e.MaxAttempts)
 }
 
 // WSReconnectExhaustedError 连接断开重连次数用尽错误
+// 通过 OnError 回调以 *WSReconnectExhaustedError 报告，语义同 WSAuthFailureError。
 type WSReconnectExhaustedError struct {
 	MaxAttempts int
 }
 
+// Error 返回包含最大重连次数的错误信息。
 func (e *WSReconnectExhaustedError) Error() string {
 	return fmt.Sprintf("max reconnect attempts exceeded (%d)", e.MaxAttempts)
 }

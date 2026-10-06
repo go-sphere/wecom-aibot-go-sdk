@@ -41,7 +41,7 @@ func init() {
 // 回调函数类型
 // ============================================================================
 
-// OnConnectedFunc 连接建立回调
+// OnConnectedFunc 连接建立回调（WsConnectionManager.OnConnected）
 type OnConnectedFunc func()
 
 // OnAuthenticatedFunc 认证成功回调
@@ -74,6 +74,12 @@ type replyQueueItem struct {
 // ============================================================================
 
 // WsConnectionManager 负责维护与企业微信的 WebSocket 长连接
+//
+// 负责建连、认证、心跳、指数退避重连以及按 req_id 串行发送回复并等待回执。WSClient
+// 在内部创建并使用它，应用代码通常应使用 WSClient。通过 NewWsConnectionManager 创建，零值不可用。
+//
+// 回调字段需在 Connect 之前设置，之后修改不是并发安全的。回调在内部协程中执行：
+// OnMessage 与 OnAuthenticated 在读协程上同步执行，OnError 与 OnReconnecting 可能在持有内部连接锁时执行，回调内不要同步调用 Connect、Disconnect 或 IsConnected。
 type WsConnectionManager struct {
 	logger Logger
 	wsURL  string
@@ -139,6 +145,10 @@ type pendingAck struct {
 }
 
 // NewWsConnectionManager 创建 WebSocket 连接管理器
+//
+// 时间参数单位均为毫秒。heartbeatInterval、reconnectBaseDelay、maxReplyQueueSize <= 0
+// 以及 maxReconnectAttempts、maxAuthFailureAttempts == 0 时使用默认值（30000、1000、500、10、5）；两个最大次数为负数表示无限重试。wsURL 为空时使用默认地址，dialer 为
+// nil 时使用零值 websocket.Dialer。logger 不能为 nil。不发起连接。
 func NewWsConnectionManager(
 	logger Logger,
 	heartbeatInterval int,
@@ -184,6 +194,7 @@ func NewWsConnectionManager(
 }
 
 // SetCredentials 设置认证凭证
+// extraAuthParams 中的键值会合入认证帧 body。需在 Connect 之前调用，不是并发安全的。
 func (m *WsConnectionManager) SetCredentials(botID, botSecret string, extraAuthParams map[string]interface{}) {
 	m.botID = botID
 	m.botSecret = botSecret
@@ -191,6 +202,8 @@ func (m *WsConnectionManager) SetCredentials(botID, botSecret string, extraAuthP
 }
 
 // Connect 建立 WebSocket 连接
+//
+// 立即返回，拨号在新协程中进行。每次调用都开始新的连接生命周期：关闭旧连接、取消挂起的重连并清零重试计数。
 func (m *WsConnectionManager) Connect() {
 	// 连接生命周期可重启：每次 Connect 都是全新开始，取消挂起的重连定时器并关闭旧连接，
 	// 复位手动关闭标记与重试计数器。
@@ -663,6 +676,7 @@ func (m *WsConnectionManager) writeMessage(conn *websocket.Conn, data []byte) er
 }
 
 // Send 发送数据帧
+// 序列化并写入当前连接，不等待回执。未连接时返回错误；可并发调用（写入被串行化）。
 func (m *WsConnectionManager) Send(frame WsFrame) error {
 	conn := m.getConn()
 	if conn == nil {
@@ -678,6 +692,8 @@ func (m *WsConnectionManager) Send(frame WsFrame) error {
 }
 
 // SendReply 通过 WebSocket 通道发送回复消息
+//
+// cmd 为空时使用 WsCmd.RESPONSE。同一 reqID 的回复排队串行发送，SendReply 阻塞直到收到回执、5 秒回执超时、发送失败或连接断开/Disconnect 取消。回执 errcode 非 0 时返回错误；排队数达到上限时立即返回错误。不要在 OnMessage 回调中同步调用。
 func (m *WsConnectionManager) SendReply(reqID string, body interface{}, cmd string) (*WsFrame, error) {
 	if cmd == "" {
 		cmd = WsCmd.RESPONSE
@@ -921,6 +937,7 @@ func (m *WsConnectionManager) clearPendingMessages(reason string) {
 }
 
 // Disconnect 断开连接
+// 关闭连接、停止心跳与自动重连，并让所有等待中的 SendReply 返回错误。之后可再次调用 Connect。
 func (m *WsConnectionManager) Disconnect() {
 	m.setManualClosed(true)
 	m.stopHeartbeat()
@@ -980,6 +997,7 @@ func (m *WsConnectionManager) isManualClosed() bool {
 }
 
 // IsConnected 获取当前连接状态
+// 返回 true 仅表示 WebSocket 已建立，不代表已认证。
 func (m *WsConnectionManager) IsConnected() bool {
 	m.wsMu.RLock()
 	defer m.wsMu.RUnlock()

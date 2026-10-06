@@ -14,13 +14,14 @@ import (
 )
 
 const (
-	// PKCS7BlockSize 企业微信加解密使用的 PKCS#7 块大小
+	// PKCS7BlockSize 企业微信加解密使用的 PKCS#7 块大小（字节）
 	PKCS7BlockSize = 32
-	// AESKeyLength AES-256 密钥长度
+	// AESKeyLength AES-256 密钥长度（字节）
 	AESKeyLength = 32
 )
 
 // DecodeEncodingAESKey 解码企业微信提供的 Base64 encodingAESKey
+// 接受 43 字符（缺少末尾 "="）或 44 字符的输入，首尾空白会被忽略。输入为空、不是合法 Base64 或解码后不是 32 字节时返回错误。
 func DecodeEncodingAESKey(encodingAESKey string) ([]byte, error) {
 	trimmed := strings.TrimSpace(encodingAESKey)
 	if trimmed == "" {
@@ -41,6 +42,8 @@ func DecodeEncodingAESKey(encodingAESKey string) ([]byte, error) {
 }
 
 // PKCS7Pad PKCS#7 填充
+// 返回新切片，长度为 blockSize 的整数倍；data 长度已是整数倍时追加一个完整块。
+// blockSize 必须在 1 到 255 之间。
 func PKCS7Pad(data []byte, blockSize int) []byte {
 	mod := len(data) % blockSize
 	pad := blockSize - mod
@@ -56,6 +59,7 @@ func PKCS7Pad(data []byte, blockSize int) []byte {
 }
 
 // PKCS7Unpad PKCS#7 解除填充
+// 返回 data 的子切片（共享底层数组）。data 为空或填充值不在 1..blockSize 范围、填充字节不一致时返回错误。
 func PKCS7Unpad(data []byte, blockSize int) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, errors.New("invalid pkcs7 payload")
@@ -79,6 +83,8 @@ func PKCS7Unpad(data []byte, blockSize int) ([]byte, error) {
 //
 // 独立于 Webhook、WebSocket、Agent 的具体协议形态，统一提供基于 AES-256-CBC
 // 的加解密与 SHA1 签名计算能力。
+//
+// 通过 NewWecomCrypto 创建，零值不可用；创建后不可变，可并发使用。
 type WecomCrypto struct {
 	token     string
 	aesKey    []byte
@@ -91,6 +97,9 @@ type WecomCrypto struct {
 //	token         - 企业微信后台配置的 Token
 //	encodingAESKey - 企业微信后台配置的 EncodingAESKey
 //	receiveId      - 对应企业微信的 corpId 或 botId（用于校验与追加）
+//
+// token 为空或 encodingAESKey 无效时返回错误。receiveID 为空时 Decrypt 不校验尾部的
+// receiveId。
 func NewWecomCrypto(token, encodingAESKey, receiveID string) (*WecomCrypto, error) {
 	if token == "" {
 		return nil, errors.New("token is required")
@@ -108,6 +117,7 @@ func NewWecomCrypto(token, encodingAESKey, receiveID string) (*WecomCrypto, erro
 }
 
 // ComputeSignature 计算 WeCom 消息签名
+// 将 token、timestamp、nonce、encrypt 按字典序排序拼接后做 SHA1，返回小写十六进制字符串。
 func (c *WecomCrypto) ComputeSignature(timestamp, nonce, encrypt string) string {
 	parts := []string{c.token, timestamp, nonce, encrypt}
 	sort.Strings(parts)
@@ -116,6 +126,7 @@ func (c *WecomCrypto) ComputeSignature(timestamp, nonce, encrypt string) string 
 }
 
 // VerifySignature 验证 WeCom 消息签名
+// 签名与 ComputeSignature 的结果完全一致时返回 true（普通字符串比较，非常量时间比较）。
 func (c *WecomCrypto) VerifySignature(signature, timestamp, nonce, encrypt string) bool {
 	expected := c.ComputeSignature(timestamp, nonce, encrypt)
 	return expected == signature
@@ -124,6 +135,9 @@ func (c *WecomCrypto) VerifySignature(signature, timestamp, nonce, encrypt strin
 // Decrypt 消息解密
 //
 // 返回纯文本字符串（XML 或 JSON 根据上层业务而定）
+//
+// encryptText 为 Base64 密文，不校验签名，调用方应先用 VerifySignature 校验。
+// Base64 无效、密文长度无效、填充无效、明文结构无效，或配置了 receiveID 而明文尾部不一致时返回错误。
 func (c *WecomCrypto) Decrypt(encryptText string) (string, error) {
 	block, err := aes.NewCipher(c.aesKey)
 	if err != nil {
@@ -175,6 +189,8 @@ func (c *WecomCrypto) Decrypt(encryptText string) (string, error) {
 // Encrypt 消息加密
 //
 // 加密明文并返回 base64 格式密文与对应的新签名
+//
+// 每次调用使用新的 16 字节随机前缀，因此相同输入的密文不同。timestamp 与 nonce 只参与签名计算。
 func (c *WecomCrypto) Encrypt(plainText, timestamp, nonce string) (encrypt, signature string, err error) {
 	random16 := make([]byte, 16)
 	if _, err := rand.Read(random16); err != nil {
