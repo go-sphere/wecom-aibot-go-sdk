@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
@@ -126,10 +127,10 @@ func (c *WecomCrypto) ComputeSignature(timestamp, nonce, encrypt string) string 
 }
 
 // VerifySignature 验证 WeCom 消息签名
-// 签名与 ComputeSignature 的结果完全一致时返回 true（普通字符串比较，非常量时间比较）。
+// 签名与 ComputeSignature 的结果完全一致时返回 true（常量时间比较）。
 func (c *WecomCrypto) VerifySignature(signature, timestamp, nonce, encrypt string) bool {
 	expected := c.ComputeSignature(timestamp, nonce, encrypt)
-	return expected == signature
+	return subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) == 1
 }
 
 // Decrypt 消息解密
