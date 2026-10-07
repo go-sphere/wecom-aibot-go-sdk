@@ -97,7 +97,9 @@ func main() {
 		}
 		fmt.Printf("用户进入会话: %s\n", eventMsg.From.UserID)
 		welcomeBody := aibot.CreateTextReplyBody("你好！我是 AI 助手，可以帮你读写文件和执行命令。")
-		_, _ = client.ReplyWelcome(frame, welcomeBody)
+		// Handlers run on the read goroutine; ReplyWelcome waits for its ack,
+		// which that goroutine delivers, so it must not be called inline.
+		go func() { _, _ = client.ReplyWelcome(frame, welcomeBody) }()
 	})
 
 	// Connect and wait for exit

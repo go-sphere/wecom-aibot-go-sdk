@@ -106,7 +106,7 @@ func main() {
 	})
 
 	// 文本消息 - Anthropic 流式对话（使用节流发送，避免 ack 超时）
-	client.OnMessageText(func(frame *aibot.WsFrame) {
+	client.OnMessageText(async(func(frame *aibot.WsFrame) {
 		var msg aibot.TextMessage
 		if err := aibot.ParseMessageBody(frame, &msg); err != nil {
 			fmt.Println("解析消息失败:", err.Error())
@@ -197,10 +197,10 @@ func main() {
 
 		close(done)
 		<-finishDone
-	})
+	}))
 
 	// 图片消息
-	client.OnMessageImage(func(frame *aibot.WsFrame) {
+	client.OnMessageImage(async(func(frame *aibot.WsFrame) {
 		var msg aibot.ImageMessage
 		if err := aibot.ParseMessageBody(frame, &msg); err != nil {
 			fmt.Println("解析消息失败:", err.Error())
@@ -218,16 +218,17 @@ func main() {
 			filename = "image.jpg"
 		}
 		tmpDir, _ := os.MkdirTemp("", "wecom-")
-		tmpPath := filepath.Join(tmpDir, filename)
+		// filename comes from the download response; keep only its base name.
+		tmpPath := filepath.Join(tmpDir, filepath.Base(filename))
 		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 			fmt.Println("保存文件失败:", err.Error())
 		} else {
 			fmt.Printf("图片已保存: %s (%d bytes)\n", tmpPath, len(data))
 		}
-	})
+	}))
 
 	// 视频消息
-	client.OnMessageVideo(func(frame *aibot.WsFrame) {
+	client.OnMessageVideo(async(func(frame *aibot.WsFrame) {
 		var msg aibot.VideoMessage
 		if err := aibot.ParseMessageBody(frame, &msg); err != nil {
 			fmt.Println("解析消息失败:", err.Error())
@@ -245,16 +246,17 @@ func main() {
 			filename = "video.mp4"
 		}
 		tmpDir, _ := os.MkdirTemp("", "wecom-")
-		tmpPath := filepath.Join(tmpDir, filename)
+		// filename comes from the download response; keep only its base name.
+		tmpPath := filepath.Join(tmpDir, filepath.Base(filename))
 		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 			fmt.Println("保存文件失败:", err.Error())
 		} else {
 			fmt.Printf("视频已保存: %s (%d bytes)\n", tmpPath, len(data))
 		}
-	})
+	}))
 
 	// 文件消息
-	client.OnMessageFile(func(frame *aibot.WsFrame) {
+	client.OnMessageFile(async(func(frame *aibot.WsFrame) {
 		var msg aibot.FileMessage
 		if err := aibot.ParseMessageBody(frame, &msg); err != nil {
 			fmt.Println("解析消息失败:", err.Error())
@@ -272,13 +274,14 @@ func main() {
 			filename = "file.dat"
 		}
 		tmpDir, _ := os.MkdirTemp("", "wecom-")
-		tmpPath := filepath.Join(tmpDir, filename)
+		// filename comes from the download response; keep only its base name.
+		tmpPath := filepath.Join(tmpDir, filepath.Base(filename))
 		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
 			fmt.Println("保存文件失败:", err.Error())
 		} else {
 			fmt.Printf("文件已保存: %s (%d bytes)\n", tmpPath, len(data))
 		}
-	})
+	}))
 
 	// 事件处理
 	client.OnEvent(func(frame *aibot.WsFrame) {
@@ -286,7 +289,7 @@ func main() {
 		fmt.Printf("收到事件: %s\n", eventType)
 	})
 
-	client.OnEventEnterChat(func(frame *aibot.WsFrame) {
+	client.OnEventEnterChat(async(func(frame *aibot.WsFrame) {
 		var eventMsg aibot.EventMessage
 		if err := aibot.ParseMessageBody(frame, &eventMsg); err != nil {
 			fmt.Println("解析事件失败:", err.Error())
@@ -295,7 +298,7 @@ func main() {
 		fmt.Printf("用户进入会话: %s\n", eventMsg.From.UserID)
 		welcomeBody := aibot.CreateTextReplyBody("你好！有什么可以帮助你的吗？")
 		_, _ = client.ReplyWelcome(frame, welcomeBody)
-	})
+	}))
 
 	client.OnEventTemplateCardEvent(func(frame *aibot.WsFrame) {
 		var eventMsg aibot.EventMessage
@@ -322,4 +325,12 @@ func main() {
 	fmt.Println("\n正在断开连接...")
 	client.Disconnect()
 	fmt.Println("已退出")
+}
+
+// async runs h on its own goroutine. Handlers execute on the connection's read
+// goroutine, so a handler that waits for a reply ack (Reply*, ReplyWelcome) or
+// does slow work (DownloadFile) would otherwise block every following frame,
+// including that ack, until the 5s ack timeout.
+func async(h func(frame *aibot.WsFrame)) func(frame *aibot.WsFrame) {
+	return func(frame *aibot.WsFrame) { go h(frame) }
 }
