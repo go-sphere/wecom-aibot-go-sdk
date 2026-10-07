@@ -44,9 +44,6 @@
 // [WSClient.Reply]、[WSClient.ReplyStream]、[WSClient.ReplyWelcome] 等方法会一直阻塞到 5 秒回执超时并返回错误，同时阻塞后续消息，因此应在新协程中调用它们。
 // 回调可以在 Connect 前后随时注册或替换，注册方法可并发调用。
 //
-// OnError 与 OnReconnecting 可能在 SDK 内部持有连接锁时被调用，回调内不要同步调用
-// Connect、Disconnect 或 IsConnected；需要重连时请在新协程中调用 Connect。
-//
 // # 回复与发送
 //
 // 被动回复（Reply 系列）必须使用收到的回调帧，同一 req_id 的回复按调用顺序串行发送，每条都阻塞等待服务端回执（最长 5 秒）。流式回复用同一个 streamID 多次调用

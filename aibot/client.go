@@ -391,8 +391,7 @@ func (c *WSClient) OnDisconnected(handler DisconnectHandlerFunc) {
 
 // OnReconnecting 重连中
 //
-// 在安排下一次重连时调用。回调可能在 SDK 持有内部连接锁时执行，回调内不要同步调用
-// Connect、Disconnect 或 IsConnected。
+// 在安排下一次重连时调用，attempt 为本轮重试次数（从 1 开始）。
 func (c *WSClient) OnReconnecting(handler ReconnectHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -401,7 +400,7 @@ func (c *WSClient) OnReconnecting(handler ReconnectHandlerFunc) {
 
 // OnError 发生错误
 //
-// 错误类型见 ErrorHandlerFunc。回调可能在 SDK 持有内部连接锁时执行，回调内不要同步调用 Connect、Disconnect 或 IsConnected；需要重新连接时请在新协程中调用 Connect。
+// 错误类型见 ErrorHandlerFunc。重连或认证重试耗尽后可在回调内再次调用 Connect 重新连接。
 func (c *WSClient) OnError(handler ErrorHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

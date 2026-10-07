@@ -79,7 +79,7 @@ type replyQueueItem struct {
 // 在内部创建并使用它，应用代码通常应使用 WSClient。通过 NewWsConnectionManager 创建，零值不可用。
 //
 // 回调字段需在 Connect 之前设置，之后修改不是并发安全的。回调在内部协程中执行：
-// OnMessage 与 OnAuthenticated 在读协程上同步执行，OnError 与 OnReconnecting 可能在持有内部连接锁时执行，回调内不要同步调用 Connect、Disconnect 或 IsConnected。
+// OnMessage 与 OnAuthenticated 在读协程上同步执行。
 type WsConnectionManager struct {
 	logger Logger
 	wsURL  string
@@ -574,60 +574,58 @@ func (m *WsConnectionManager) stopHeartbeat() {
 //
 // disconnected_event（被踢下线）不会触发重连，因为 isManualClose 已被设为 true。
 func (m *WsConnectionManager) scheduleReconnect() {
+	// 回调在释放 wsMu 之后执行：WSClient 的回调会获取 WSClient.mu，而 Connect/Disconnect
+	// 持有 WSClient.mu 时会获取 wsMu，在锁内回调会形成锁顺序反转导致死锁。
+	var notify func()
+	defer func() {
+		if notify != nil {
+			notify()
+		}
+	}()
+
 	m.wsMu.Lock()
 	defer m.wsMu.Unlock()
 
+	attempts, maxAttempts := &m.reconnectAttempts, m.maxReconnectAttempts
 	if m.lastCloseWasAuthFailure {
-		// 认证失败场景
-		if m.maxAuthFailureAttempts > 0 && m.authFailureAttempts >= m.maxAuthFailureAttempts {
-			m.logger.Error("Max auth failure attempts reached (%d), giving up", m.maxAuthFailureAttempts)
-			if m.OnError != nil {
-				m.OnError(&WSAuthFailureError{MaxAttempts: m.maxAuthFailureAttempts})
-			}
-			return
-		}
-		m.authFailureAttempts++
-
-		delay := m.reconnectBaseDelay * (1 << (m.authFailureAttempts - 1))
-		if delay > reconnectMaxDelay {
-			delay = reconnectMaxDelay
-		}
-
-		m.logger.Info("Auth failed, reconnecting in %dms (auth attempt %d/%d)...", delay, m.authFailureAttempts, m.maxAuthFailureAttempts)
-		if m.OnReconnecting != nil {
-			m.OnReconnecting(m.authFailureAttempts)
-		}
-
-		m.reconnectTimer = time.AfterFunc(
-			time.Duration(delay)*time.Millisecond,
-			m.reconnectTimerFired,
-		)
-	} else {
-		// 连接断开场景（网络异常、心跳超时等）
-		if m.maxReconnectAttempts > 0 && m.reconnectAttempts >= m.maxReconnectAttempts {
-			m.logger.Error("Max reconnect attempts reached (%d), giving up", m.maxReconnectAttempts)
-			if m.OnError != nil {
-				m.OnError(&WSReconnectExhaustedError{MaxAttempts: m.maxReconnectAttempts})
-			}
-			return
-		}
-		m.reconnectAttempts++
-
-		delay := m.reconnectBaseDelay * (1 << (m.reconnectAttempts - 1))
-		if delay > reconnectMaxDelay {
-			delay = reconnectMaxDelay
-		}
-
-		m.logger.Info("Connection lost, reconnecting in %dms (attempt %d/%d)...", delay, m.reconnectAttempts, m.maxReconnectAttempts)
-		if m.OnReconnecting != nil {
-			m.OnReconnecting(m.reconnectAttempts)
-		}
-
-		m.reconnectTimer = time.AfterFunc(
-			time.Duration(delay)*time.Millisecond,
-			m.reconnectTimerFired,
-		)
+		attempts, maxAttempts = &m.authFailureAttempts, m.maxAuthFailureAttempts
 	}
+
+	if maxAttempts > 0 && *attempts >= maxAttempts {
+		var err error
+		if m.lastCloseWasAuthFailure {
+			m.logger.Error("Max auth failure attempts reached (%d), giving up", maxAttempts)
+			err = &WSAuthFailureError{MaxAttempts: maxAttempts}
+		} else {
+			m.logger.Error("Max reconnect attempts reached (%d), giving up", maxAttempts)
+			err = &WSReconnectExhaustedError{MaxAttempts: maxAttempts}
+		}
+		if onError := m.OnError; onError != nil {
+			notify = func() { onError(err) }
+		}
+		return
+	}
+	*attempts++
+	attempt := *attempts
+
+	delay := m.reconnectBaseDelay * (1 << (attempt - 1))
+	if delay > reconnectMaxDelay {
+		delay = reconnectMaxDelay
+	}
+
+	if m.lastCloseWasAuthFailure {
+		m.logger.Info("Auth failed, reconnecting in %dms (auth attempt %d/%d)...", delay, attempt, maxAttempts)
+	} else {
+		m.logger.Info("Connection lost, reconnecting in %dms (attempt %d/%d)...", delay, attempt, maxAttempts)
+	}
+	if onReconnecting := m.OnReconnecting; onReconnecting != nil {
+		notify = func() { onReconnecting(attempt) }
+	}
+
+	m.reconnectTimer = time.AfterFunc(
+		time.Duration(delay)*time.Millisecond,
+		m.reconnectTimerFired,
+	)
 }
 
 // reconnectTimerFired 重连定时器到期的公共入口

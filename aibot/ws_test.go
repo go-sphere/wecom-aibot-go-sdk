@@ -514,3 +514,29 @@ func TestEarlyDisconnectKeepsDisconnected(t *testing.T) {
 	}
 	t.Fatal("server connection still alive after client Disconnect")
 }
+
+// TestReconnectCallbackCanDisconnect 验证 OnReconnecting 回调不在 wsMu 内执行：
+// 回调内同步调用 Disconnect（会获取 wsMu）不应死锁。
+func TestReconnectCallbackCanDisconnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	url := "ws://" + ln.Addr().String()
+	_ = ln.Close() // 拨号必然失败，触发 scheduleReconnect
+
+	mgr := newTestManager(t, url)
+	done := make(chan struct{})
+	var once sync.Once
+	mgr.OnReconnecting = func(int) {
+		mgr.Disconnect()
+		once.Do(func() { close(done) })
+	}
+	mgr.Connect()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Disconnect inside OnReconnecting deadlocked")
+	}
+}
