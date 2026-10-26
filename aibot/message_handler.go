@@ -176,7 +176,7 @@ func toString(v interface{}) string {
 // ============================================================================
 
 // FrameEmitter 帧事件发射器接口
-// MessageHandler.HandleFrame 通过它分发帧；WSClient 实现了该接口，将帧转发给已注册的回调。实现应能处理在读协程上被同步调用。
+// MessageHandler.HandleFrame 通过它分发帧；WSClient 实现了该接口，将帧转发给已注册的回调。实现在分发协程上被串行调用。
 type FrameEmitter interface {
 	// 通用消息事件
 	EmitMessage(frame *WsFrame)

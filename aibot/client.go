@@ -17,8 +17,8 @@ var ErrReplySkipped = errors.New("reply skipped: previous message still pending 
 
 // MessageHandlerFunc 消息处理函数。
 // frame 为收到的回调帧，可传给 ParseMessageBody 解析，或作为 Reply 系列方法的参数。
-// 函数在连接的读协程上同步执行，执行期间不会处理后续帧；阻塞操作（含 Reply 系列）
-// 应放到新协程中执行。
+// 函数在分发协程上按到达顺序串行执行，可直接调用 Reply 系列方法等待回执；
+// 耗时操作会推迟后续帧的分发。
 type MessageHandlerFunc func(frame *WsFrame)
 
 // EventHandlerFunc 事件处理函数。

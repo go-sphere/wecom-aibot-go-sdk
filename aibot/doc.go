@@ -22,13 +22,10 @@
 //		if err := aibot.ParseMessageBody(frame, &msg); err != nil {
 //			return
 //		}
-//		// 回调运行在连接的读协程上，阻塞等待回执的回复方法必须放到新协程中调用。
-//		go func() {
-//			streamID := "stream_" + frame.Headers.ReqID
-//			if _, err := client.ReplyStream(frame, streamID, "你说的是: "+msg.Text.Content, true, nil, nil); err != nil {
-//				fmt.Println("reply failed:", err)
-//			}
-//		}()
+//		streamID := "stream_" + frame.Headers.ReqID
+//		if _, err := client.ReplyStream(frame, streamID, "你说的是: "+msg.Text.Content, true, nil, nil); err != nil {
+//			fmt.Println("reply failed:", err)
+//		}
 //	})
 //
 //	client.Connect() // 异步建连并认证
@@ -40,8 +37,8 @@
 //
 // # 回调与并发
 //
-// 消息与事件回调（OnMessage*、OnEvent*）以及 OnAuthenticated 在当前连接的读协程上同步执行：回调返回前不会读取下一帧，包括回复的回执帧。在回调内直接调用
-// [WSClient.Reply]、[WSClient.ReplyStream]、[WSClient.ReplyWelcome] 等方法会一直阻塞到 5 秒回执超时并返回错误，同时阻塞后续消息，因此应在新协程中调用它们。
+// 消息与事件回调（OnMessage*、OnEvent*）在独立的分发协程上按到达顺序串行执行，回执帧仍由读协程投递，因此可以在回调内直接调用
+// [WSClient.Reply]、[WSClient.ReplyStream]、[WSClient.ReplyWelcome] 等方法并等待回执。耗时操作会推迟后续消息的分发，可自行放到新协程中；OnAuthenticated 仍在读协程上同步执行。
 // 回调可以在 Connect 前后随时注册或替换，注册方法可并发调用。
 //
 // # 回复与发送

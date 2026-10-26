@@ -28,6 +28,9 @@ const (
 	replyAckTimeoutMs          = 5000 // 回执超时 (ms)
 	defaultMaxReplyQueueSize   = 500  // 单个 req_id 的默认最大队列长度
 	defaultMaxAuthFailAttempts = 5    // 默认认证失败最大重试次数
+
+	// dispatchQueueSize buffers callback frames while a handler is busy; frames are dropped when full.
+	dispatchQueueSize = 256
 )
 
 // replyAckTimeout 回执超时（毫秒）。原子变量：正常保持默认值，测试可缩短超时。
@@ -79,7 +82,8 @@ type replyQueueItem struct {
 // 在内部创建并使用它，应用代码通常应使用 WSClient。通过 NewWsConnectionManager 创建，零值不可用。
 //
 // 回调字段需在 Connect 之前设置，之后修改不是并发安全的。回调在内部协程中执行：
-// OnMessage 与 OnAuthenticated 在读协程上同步执行。
+// OnAuthenticated 在读协程上同步执行；OnMessage 在独立的分发协程上按到达顺序串行执行，
+// 因此可以在回调内直接发送回复并等待回执。
 type WsConnectionManager struct {
 	logger Logger
 	wsURL  string
@@ -125,6 +129,12 @@ type WsConnectionManager struct {
 	pendingAcks   map[string]*pendingAck
 	pendingAcksMu sync.Mutex
 	pendingAckSeq uint64
+
+	// dispatchCh feeds a single consumer so handlers keep arrival order and never block the read loop,
+	// which must stay free to deliver the reply acks those handlers wait on.
+	dispatchCh   chan *WsFrame
+	dispatchMu   sync.Mutex
+	dispatchStop chan struct{}
 
 	// 回调函数
 	OnConnected        OnConnectedFunc
@@ -190,6 +200,73 @@ func NewWsConnectionManager(
 
 		replyQueues: make(map[string][]replyQueueItem),
 		pendingAcks: make(map[string]*pendingAck),
+		dispatchCh:  make(chan *WsFrame, dispatchQueueSize),
+	}
+}
+
+// startDispatch starts the dispatch goroutine if it is not running; reconnects reuse the same one
+// so frames are never split across consumers.
+func (m *WsConnectionManager) startDispatch() {
+	m.dispatchMu.Lock()
+	defer m.dispatchMu.Unlock()
+	if m.dispatchStop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	m.dispatchStop = stop
+	go m.dispatchLoop(stop)
+}
+
+// stopDispatch stops the dispatch goroutine and drops queued frames so a later Connect
+// does not deliver frames from the previous lifecycle.
+func (m *WsConnectionManager) stopDispatch() {
+	m.dispatchMu.Lock()
+	defer m.dispatchMu.Unlock()
+	if m.dispatchStop == nil {
+		return
+	}
+	close(m.dispatchStop)
+	m.dispatchStop = nil
+	for {
+		select {
+		case <-m.dispatchCh:
+		default:
+			return
+		}
+	}
+}
+
+func (m *WsConnectionManager) dispatchLoop(stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		case frame := <-m.dispatchCh:
+			m.dispatch(frame)
+		}
+	}
+}
+
+// dispatch calls OnMessage and recovers panics so one bad handler cannot stop later deliveries.
+func (m *WsConnectionManager) dispatch(frame *WsFrame) {
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error("Panic in OnMessage handler: cmd=%s, reqId=%s, panic=%v", frame.Cmd, frame.Headers.ReqID, r)
+		}
+	}()
+	if m.OnMessage != nil {
+		m.OnMessage(frame)
+	}
+}
+
+// enqueueDispatch hands a frame to the dispatch goroutine; it drops instead of blocking,
+// since a blocked read loop could not deliver the acks a waiting handler needs.
+func (m *WsConnectionManager) enqueueDispatch(frame *WsFrame) {
+	select {
+	case m.dispatchCh <- frame:
+	default:
+		m.logger.Warn("Dispatch queue full (%d), dropping frame: cmd=%s, reqId=%s",
+			dispatchQueueSize, frame.Cmd, frame.Headers.ReqID)
 	}
 }
 
@@ -276,6 +353,7 @@ func (m *WsConnectionManager) setupEventHandlers() {
 	if conn == nil {
 		return
 	}
+	m.startDispatch()
 
 	// 读取消息。
 	// 注意：每次建连都会启动一个新的读协程，因此这里持有本次连接的局部引用 conn，
@@ -324,9 +402,7 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 	// 消息推送回调
 	if cmd == WsCmd.CALLBACK {
 		m.logger.Debug("[server -> plugin] cmd=%s, reqId=%s", cmd, reqID)
-		if m.OnMessage != nil {
-			m.OnMessage(&frame)
-		}
+		m.enqueueDispatch(&frame)
 		return
 	}
 
@@ -337,10 +413,8 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 		// 检测 disconnected_event：有新连接建立，服务端通知旧连接即将被断开
 		if m.isDisconnectedEvent(&frame) {
 			m.logger.Warn("Received disconnected_event: a new connection has been established, this connection will be closed by server")
-			// 先分发事件给上层（让用户可以监听 disconnected_event）
-			if m.OnMessage != nil {
-				m.OnMessage(&frame)
-			}
+			// Queue the event for handlers; cleanup does not wait since acks can no longer arrive.
+			m.enqueueDispatch(&frame)
 			// 停止心跳、清理待处理消息
 			m.stopHeartbeat()
 			m.clearPendingMessages("Server disconnected due to new connection")
@@ -358,13 +432,12 @@ func (m *WsConnectionManager) handleMessage(data []byte) {
 			return
 		}
 
-		if m.OnMessage != nil {
-			m.OnMessage(&frame)
-		}
+		m.enqueueDispatch(&frame)
 		return
 	}
 
-	// 无 cmd 的帧：认证响应、心跳响应或回复消息回执
+	// 无 cmd 的帧：认证响应、心跳响应或回复消息回执。
+	// These stay on the read loop so acks reach handlers that are blocked waiting for them.
 
 	// 认证响应（优先于 pendingAcks 检查，避免误判）
 	if strings.HasPrefix(reqID, WsCmd.SUBSCRIBE) {
@@ -945,6 +1018,7 @@ func (m *WsConnectionManager) Disconnect() {
 	m.stopReconnectTimer()
 
 	m.closeConn()
+	m.stopDispatch()
 
 	m.logger.Info("WebSocket connection manually closed")
 }

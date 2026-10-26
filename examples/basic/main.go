@@ -327,10 +327,8 @@ func main() {
 	fmt.Println("已退出")
 }
 
-// async runs h on its own goroutine. Handlers execute on the connection's read
-// goroutine, so a handler that waits for a reply ack (Reply*, ReplyWelcome) or
-// does slow work (DownloadFile) would otherwise block every following frame,
-// including that ack, until the 5s ack timeout.
+// async runs h on its own goroutine so slow handlers (streaming, DownloadFile)
+// do not delay dispatch of later frames; replies awaited inline work either way.
 func async(h func(frame *aibot.WsFrame)) func(frame *aibot.WsFrame) {
 	return func(frame *aibot.WsFrame) { go h(frame) }
 }
