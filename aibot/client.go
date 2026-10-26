@@ -17,8 +17,8 @@ var ErrReplySkipped = errors.New("reply skipped: previous message still pending 
 
 // MessageHandlerFunc 消息处理函数。
 // frame 为收到的回调帧，可传给 ParseMessageBody 解析，或作为 Reply 系列方法的参数。
-// 函数在分发协程上按到达顺序串行执行，可直接调用 Reply 系列方法等待回执；
-// 耗时操作会推迟后续帧的分发。
+// 函数在当前连接生命周期的分发协程上按到达顺序串行执行，可直接调用 Reply 系列方法等待回执。
+// 耗时操作会推迟后续帧的分发并增加内存中的积压，可自行放到新协程中。
 type MessageHandlerFunc func(frame *WsFrame)
 
 // EventHandlerFunc 事件处理函数。
@@ -242,7 +242,9 @@ func (c *WSClient) Connect() *WSClient {
 
 // Disconnect 断开 WebSocket 连接
 //
-// 关闭当前连接、停止心跳并取消挂起的自动重连；正在等待回执或排队中的回复立即以错误返回。客户端未启动时只记录警告。Disconnect 不等待后台协程退出；之后可再次调用 Connect 重新连接。
+// 关闭当前连接、停止心跳并取消挂起的自动重连；正在等待回执或排队中的回复立即以错误返回。
+// 未开始的消息和事件回调被丢弃，正在执行的回调会继续完成。Disconnect 不等待后台协程退出，
+// 可在回调内调用；之后可再次 Connect，新生命周期使用独立的分发队列。客户端未启动时只记录警告。
 func (c *WSClient) Disconnect() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -354,7 +356,8 @@ func (c *WSClient) OnEventFeedbackEvent(handler EventHandlerFunc) {
 
 // OnEventDisconnected 收到连接断开事件（有新连接建立，服务端主动断开当前旧连接）
 //
-// 收到该事件后 SDK 关闭旧连接、不再自动重连，并随后触发 OnDisconnected。
+// 收到该事件后 SDK 立即关闭旧连接、不再自动重连；已排队的回调依次执行，
+// 最后执行本事件回调、OnDisconnected，并退出分发协程。
 func (c *WSClient) OnEventDisconnected(handler EventHandlerFunc) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

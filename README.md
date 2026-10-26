@@ -235,6 +235,13 @@ client.OnMessageImage(func(frame *aibot.WsFrame) {
 | `OnEventEnterChat` | `frame: *WsFrame` | 收到进入会话事件（用户当天首次进入单聊会话） |
 | `OnEventTemplateCardEvent` | `frame: *WsFrame` | 收到模板卡片事件（用户点击卡片按钮） |
 | `OnEventFeedbackEvent` | `frame: *WsFrame` | 收到用户反馈事件 |
+| `OnEventDisconnected` | `frame: *WsFrame` | 服务端因新连接建立而断开当前连接 |
+
+消息和事件回调在当前连接生命周期的独立协程中按到达顺序执行，可直接调用 `Reply*` 等待回执。`OnAuthenticated` 仍在读协程上执行，不能在其中同步等待回执。
+
+待分发回调使用可增长的内存队列，积压达到 256 条时记录警告，不因队列满而丢弃消息。耗时回调应自行启动协程处理，避免持续积压导致内存增长。`Disconnect` 或重试耗尽会清空未开始的回调，正在执行的回调会继续完成；下次 `Connect` 使用独立队列。
+
+收到 `disconnected_event` 时立即关闭连接，按顺序处理已排队的回调、`OnEventDisconnected` 和 `OnDisconnected`，随后退出分发协程。
 
 ## 消息类型
 

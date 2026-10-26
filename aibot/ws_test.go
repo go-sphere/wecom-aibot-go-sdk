@@ -360,8 +360,11 @@ func TestAuthFailureExhaustionStopsReconnect(t *testing.T) {
 	mgr.Connect()
 
 	select {
-	case <-exhausted:
+	case err := <-exhausted:
 		// 认证失败达到上限，停止自动重连
+		if err == nil {
+			t.Fatal("auth failure exhaustion returned a nil error")
+		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("auth failure exhaustion error not fired")
 	}
