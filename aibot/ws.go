@@ -101,6 +101,9 @@ type WsConnectionManager struct {
 	writeMu sync.Mutex
 
 	isManualClose bool
+	// lifecycle 在每次 Connect/Disconnect 时递增（受 wsMu 保护）。重连定时器记录
+	// 武装时的值，到期时若已变化说明它属于已结束的连接生命周期，必须丢弃。
+	lifecycle uint64
 
 	// 认证凭证
 	botID           string
@@ -213,27 +216,42 @@ func (m *WsConnectionManager) SetCredentials(botID, botSecret string, extraAuthP
 func (m *WsConnectionManager) Connect() {
 	// 连接生命周期可重启：每次 Connect 都是全新开始，取消挂起的重连定时器并关闭旧连接，
 	// 复位手动关闭标记与重试计数器。
-	m.beginConnect(true)
+	m.beginConnect()
 }
 
 // reconnect 自动重连：保留重试计数器（authFailureAttempts/reconnectAttempts 不清零），
 // 使"最大重试次数"在单个连接生命周期内真正生效。
-func (m *WsConnectionManager) reconnect() {
-	m.beginConnect(false)
+func (m *WsConnectionManager) reconnect(lifecycle uint64) {
+	// 校验与关旧连接在同一把锁内完成：定时器回调通过检查后若 Disconnect/Connect
+	// 先到，旧回调不能再关掉新生命周期的连接或多开一个 connect。
+	m.wsMu.Lock()
+	if m.isManualClose || m.lifecycle != lifecycle {
+		m.wsMu.Unlock()
+		return
+	}
+	if m.reconnectTimer != nil {
+		m.reconnectTimer.Stop()
+		m.reconnectTimer = nil
+	}
+	if m.ws != nil {
+		_ = m.ws.Close()
+		m.ws = nil
+	}
+	m.wsMu.Unlock()
+
+	m.logger.Info("Connecting to WebSocket: %s...", m.wsURL)
+
+	go m.connect()
 }
 
-func (m *WsConnectionManager) beginConnect(fresh bool) {
-	if fresh {
-		m.setManualClosed(false)
-	}
+func (m *WsConnectionManager) beginConnect() {
+	m.setManualClosed(false)
 	// 取消挂起的重连定时器，防止与当前 connect 竞态
 	m.stopReconnectTimer()
 
 	// 清理可能未完全关闭的旧连接
 	m.closeConn()
-	if fresh {
-		m.stopDispatch()
-	}
+	m.stopDispatch()
 
 	m.logger.Info("Connecting to WebSocket: %s...", m.wsURL)
 
@@ -640,19 +658,16 @@ func (m *WsConnectionManager) scheduleReconnect() {
 		notify = func() { onReconnecting(attempt) }
 	}
 
+	lifecycle := m.lifecycle
 	m.reconnectTimer = time.AfterFunc(
 		time.Duration(delay)*time.Millisecond,
-		m.reconnectTimerFired,
+		func() { m.reconnectTimerFired(lifecycle) },
 	)
 }
 
-// reconnectTimerFired 重连定时器到期的公共入口
-func (m *WsConnectionManager) reconnectTimerFired() {
-	m.stopReconnectTimer()
-	if m.isManualClosed() {
-		return
-	}
-	m.reconnect()
+// reconnectTimerFired 重连定时器到期的公共入口。lifecycle 是武装定时器时的连接生命周期。
+func (m *WsConnectionManager) reconnectTimerFired(lifecycle uint64) {
+	m.reconnect(lifecycle)
 }
 
 // stopReconnectTimer 取消挂起的重连定时器
@@ -998,6 +1013,7 @@ func (m *WsConnectionManager) closeConn() {
 func (m *WsConnectionManager) setManualClosed(manual bool) {
 	m.wsMu.Lock()
 	m.isManualClose = manual
+	m.lifecycle++
 	if !manual {
 		m.lastCloseWasAuthFailure = false
 		m.reconnectAttempts = 0

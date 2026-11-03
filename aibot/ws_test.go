@@ -543,3 +543,35 @@ func TestReconnectCallbackCanDisconnect(t *testing.T) {
 		t.Fatal("Disconnect inside OnReconnecting deadlocked")
 	}
 }
+
+// TestStaleReconnectTimerDoesNotDisturbNewLifecycle 验证：属于已结束生命周期的重连定时器
+// 回调（已通过 isManualClosed 检查之后遇到 Disconnect+Connect）既不关闭新连接，也不多开连接。
+func TestStaleReconnectTimerDoesNotDisturbNewLifecycle(t *testing.T) {
+	url, connCh, cleanup := startWSMirror(t)
+	defer cleanup()
+
+	mgr := newTestManager(t, url)
+	mgr.Connect()
+	waitConnected(t, mgr)
+	<-connCh
+
+	mgr.wsMu.RLock()
+	stale := mgr.lifecycle
+	mgr.wsMu.RUnlock()
+
+	mgr.Disconnect()
+	mgr.Connect()
+	waitConnected(t, mgr)
+	authOK(t, <-connCh)
+
+	mgr.reconnectTimerFired(stale)
+
+	select {
+	case <-connCh:
+		t.Fatal("stale reconnect timer opened an extra connection")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if !mgr.IsConnected() {
+		t.Fatal("stale reconnect timer closed the connection of the new lifecycle")
+	}
+}
