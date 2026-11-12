@@ -449,21 +449,18 @@ func TestReplyAckRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSendReplyTimeout 验证回执超时：SendReply 在 replyAckTimeout 后返回错误，
+// TestSendReplyTimeout 验证回执超时：SendReply 在配置的回执超时后返回错误，
 // 且超时后同 reqID 的下一条消息仍可正常发送。
 func TestSendReplyTimeout(t *testing.T) {
 	url, connCh, cleanup := startWSMirror(t)
 	defer cleanup()
 
 	mgr := newTestManager(t, url)
+	mgr.SetReplyAckTimeout(100)
 	mgr.Connect()
 	waitConnected(t, mgr)
 	mc := <-connCh
 	authOK(t, mc)
-
-	origTimeout := replyAckTimeout.Load()
-	replyAckTimeout.Store(100) // ms
-	defer replyAckTimeout.Store(origTimeout)
 
 	start := time.Now()
 	_, err := mgr.SendReply("req-timeout", map[string]interface{}{"msgtype": "text"}, WsCmd.RESPONSE)

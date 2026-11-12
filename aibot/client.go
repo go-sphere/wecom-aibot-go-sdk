@@ -106,6 +106,9 @@ func NewWSClient(options WSClientOptions) *WSClient {
 	if options.RequestTimeout > 0 {
 		opts.RequestTimeout = options.RequestTimeout
 	}
+	if options.ReplyAckTimeout > 0 {
+		opts.ReplyAckTimeout = options.ReplyAckTimeout
+	}
 	if options.MaxReplyQueueSize > 0 {
 		opts.MaxReplyQueueSize = options.MaxReplyQueueSize
 	}
@@ -138,6 +141,7 @@ func NewWSClient(options WSClientOptions) *WSClient {
 		opts.MaxReplyQueueSize,
 		opts.MaxAuthFailureAttempts,
 	)
+	client.wsManager.SetReplyAckTimeout(opts.ReplyAckTimeout)
 
 	// 设置认证凭证
 	extraAuthParams := make(map[string]interface{})
@@ -611,7 +615,7 @@ func (c *WSClient) EmitEventDisconnected(frame *WsFrame) {
 
 // Reply 通过 WebSocket 通道发送回复消息（通用方法）
 //
-// frame 必须是收到的回调帧（不能为 nil），回复使用其 req_id；body 序列化为 JSON 作为帧的 body；cmd 为空时使用 WsCmd.RESPONSE。同一 req_id 的回复按调用顺序串行发送，Reply 阻塞直到服务端回执、5 秒回执超时、连接断开或调用 Disconnect，排队等待的时间不计入超时。成功时返回回执帧。
+// frame 必须是收到的回调帧（不能为 nil），回复使用其 req_id；body 序列化为 JSON 作为帧的 body；cmd 为空时使用 WsCmd.RESPONSE。同一 req_id 的回复按调用顺序串行发送，Reply 阻塞直到服务端回执、ReplyAckTimeout 回执超时、连接断开或调用 Disconnect，排队等待的时间不计入超时。成功时返回回执帧。
 //
 // 以下情况返回错误：req_id 为空、body 无法序列化、连接未建立、该 req_id 排队数超过
 // MaxReplyQueueSize、回执超时、回执 errcode 非 0（错误信息包含 errcode），以及连接断开导致回复被取消。不要在消息回调中同步调用，见 MessageHandlerFunc。
@@ -769,7 +773,7 @@ func (c *WSClient) UpdateTemplateCard(frame *WsFrame, templateCard TemplateCard,
 // SendMessage 主动发送消息
 // 向指定会话（单聊或群聊）主动推送消息，无需依赖收到的回调帧
 //
-// body 必须能序列化为 JSON 对象（map、struct 或其指针），否则返回错误且不发送；chatID 会写入 body 的 chatid 字段。每次调用使用新的 req_id，阻塞直到回执、5 秒回执超时或连接断开，错误语义同 Reply。
+// body 必须能序列化为 JSON 对象（map、struct 或其指针），否则返回错误且不发送；chatID 会写入 body 的 chatid 字段。每次调用使用新的 req_id，阻塞直到回执、ReplyAckTimeout 回执超时或连接断开，错误语义同 Reply。
 func (c *WSClient) SendMessage(chatID string, body interface{}) (*WsFrame, error) {
 	reqID := GenerateReqId(WsCmd.SEND_MSG)
 

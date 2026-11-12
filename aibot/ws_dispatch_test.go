@@ -92,7 +92,7 @@ func TestHandlerCanAwaitReplyAck(t *testing.T) {
 	m.setConn(conn)
 	m.setupEventHandlers()
 
-	// Comfortably under replyAckTimeout (5000ms): the point is that the ack
+	// Comfortably under the default reply ack timeout (5000ms): the point is that the ack
 	// arrives on its own, not that it beats the deadline by a hair.
 	select {
 	case err := <-done:

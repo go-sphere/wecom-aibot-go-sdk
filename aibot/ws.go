@@ -25,17 +25,10 @@ const (
 	maxMissedPong             = 2     // 最大丢失 pong 次数
 
 	// 队列参数
-	replyAckTimeoutMs          = 5000 // 回执超时 (ms)
+	defaultReplyAckTimeoutMs   = 5000 // 默认回执超时 (ms)
 	defaultMaxReplyQueueSize   = 500  // 单个 req_id 的默认最大队列长度
 	defaultMaxAuthFailAttempts = 5    // 默认认证失败最大重试次数
 )
-
-// replyAckTimeout 回执超时（毫秒）。原子变量：正常保持默认值，测试可缩短超时。
-var replyAckTimeout atomic.Int64
-
-func init() {
-	replyAckTimeout.Store(replyAckTimeoutMs)
-}
 
 // ============================================================================
 // 回调函数类型
@@ -91,6 +84,7 @@ type WsConnectionManager struct {
 	maxReconnectAttempts   int
 	maxAuthFailureAttempts int
 	maxReplyQueueSize      int
+	replyAckTimeout        int
 
 	wsMu sync.RWMutex // 保护 ws 字段的并发读写
 	ws   *websocket.Conn
@@ -151,6 +145,7 @@ type pendingAck struct {
 	reject  func(error)
 	timer   *time.Timer
 	seq     uint64
+	timeout int
 }
 
 // NewWsConnectionManager 创建 WebSocket 连接管理器
@@ -196,6 +191,7 @@ func NewWsConnectionManager(
 		maxReconnectAttempts:   maxReconnectAttempts,
 		maxAuthFailureAttempts: maxAuthFailureAttempts,
 		maxReplyQueueSize:      maxReplyQueueSize,
+		replyAckTimeout:        defaultReplyAckTimeoutMs,
 
 		replyQueues: make(map[string][]replyQueueItem),
 		pendingAcks: make(map[string]*pendingAck),
@@ -208,6 +204,16 @@ func (m *WsConnectionManager) SetCredentials(botID, botSecret string, extraAuthP
 	m.botID = botID
 	m.botSecret = botSecret
 	m.extraAuthParams = extraAuthParams
+}
+
+// SetReplyAckTimeout 设置回复回执超时（毫秒），默认 5000；timeoutMs <= 0 时恢复默认值。
+// 适用于所有通过 SendReply 等待回执的请求（Reply 系列、UploadMedia 等）。需在 Connect
+// 之前调用，之后修改不是并发安全的；WSClient 通过 WSClientOptions.ReplyAckTimeout 设置。
+func (m *WsConnectionManager) SetReplyAckTimeout(timeoutMs int) {
+	if timeoutMs <= 0 {
+		timeoutMs = defaultReplyAckTimeoutMs
+	}
+	m.replyAckTimeout = timeoutMs
 }
 
 // Connect 建立 WebSocket 连接
@@ -724,7 +730,7 @@ func (m *WsConnectionManager) Send(frame WsFrame) error {
 
 // SendReply 通过 WebSocket 通道发送回复消息
 //
-// cmd 为空时使用 WsCmd.RESPONSE。同一 reqID 的回复排队串行发送，SendReply 阻塞直到收到回执、5 秒回执超时、发送失败或连接断开/Disconnect 取消。回执 errcode 非 0 时返回错误；排队数达到上限时立即返回错误。可在 OnMessage 回调中同步调用；OnAuthenticated 仍在读协程上执行，不能同步等待回执。
+// cmd 为空时使用 WsCmd.RESPONSE。同一 reqID 的回复排队串行发送，SendReply 阻塞直到收到回执、回执超时（SetReplyAckTimeout，默认 5 秒）、发送失败或连接断开/Disconnect 取消。回执 errcode 非 0 时返回错误；排队数达到上限时立即返回错误。可在 OnMessage 回调中同步调用；OnAuthenticated 仍在读协程上执行，不能同步等待回执。
 func (m *WsConnectionManager) SendReply(reqID string, body interface{}, cmd string) (*WsFrame, error) {
 	if cmd == "" {
 		cmd = WsCmd.RESPONSE
@@ -843,9 +849,10 @@ func (m *WsConnectionManager) addPendingAck(reqID string, resolve func(*WsFrame)
 
 	// 分配唯一序列号，用于超时回调中校验是否是当前 pending
 	seq := atomic.AddUint64(&m.pendingAckSeq, 1)
+	timeoutMs := m.replyAckTimeout
 
 	timer := time.AfterFunc(
-		time.Duration(replyAckTimeout.Load())*time.Millisecond,
+		time.Duration(timeoutMs)*time.Millisecond,
 		func() {
 			m.handleReplyAckTimeout(reqID, seq)
 		},
@@ -856,6 +863,7 @@ func (m *WsConnectionManager) addPendingAck(reqID string, resolve func(*WsFrame)
 		reject:  reject,
 		timer:   timer,
 		seq:     seq,
+		timeout: timeoutMs,
 	}
 }
 
@@ -921,7 +929,7 @@ func (m *WsConnectionManager) handleReplyAckTimeout(reqID string, seq uint64) {
 	delete(m.pendingAcks, reqID)
 	m.pendingAcksMu.Unlock()
 
-	m.logger.Warn("Reply ack timeout (%dms) for reqId: %s", replyAckTimeout.Load(), reqID)
+	m.logger.Warn("Reply ack timeout (%dms) for reqId: %s", pending.timeout, reqID)
 
 	// 从队列中移除
 	m.replyQueuesMu.Lock()
@@ -933,7 +941,7 @@ func (m *WsConnectionManager) handleReplyAckTimeout(reqID string, seq uint64) {
 	}
 	m.replyQueuesMu.Unlock()
 
-	pending.reject(fmt.Errorf("reply ack timeout (%dms) for reqId: %s", replyAckTimeout.Load(), reqID))
+	pending.reject(fmt.Errorf("reply ack timeout (%dms) for reqId: %s", pending.timeout, reqID))
 
 	// 继续处理队列中的下一条
 	m.processReplyQueue(reqID)

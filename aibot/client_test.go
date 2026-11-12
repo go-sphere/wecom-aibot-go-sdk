@@ -2,6 +2,7 @@ package aibot
 
 import (
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -50,6 +51,45 @@ func TestSendMessageInvalidBody(t *testing.T) {
 	}
 	// 回执避免 goroutine 泄漏
 	mc.write(t, WsFrame{Headers: WsFrameHeaders{ReqID: sent.Headers.ReqID}})
+}
+
+// TestReplyAckTimeoutOption 验证 WSClientOptions.ReplyAckTimeout 作用于实际等待回执的发送。
+func TestReplyAckTimeoutOption(t *testing.T) {
+	url, connCh, cleanup := startWSMirror(t)
+	defer cleanup()
+
+	client := NewWSClient(WSClientOptions{
+		WSURL:           url,
+		ReplyAckTimeout: 100,
+		Logger:          nopLogger(),
+	})
+	client.Connect()
+	waitConnected(t, client.wsManager)
+	mc := <-connCh
+	authOK(t, mc)
+
+	start := time.Now()
+	_, err := client.SendMessage("chat-1", CreateTextReplyBody("hi"))
+	if err == nil {
+		t.Fatal("SendMessage succeeded despite no ack, want timeout error")
+	}
+	if !strings.Contains(err.Error(), "timeout (100ms)") {
+		t.Fatalf("error does not include configured timeout: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("timeout took too long: %v", elapsed)
+	}
+}
+
+// TestReplyAckTimeoutDefaultsToFiveSeconds 验证省略配置时保留原有 5 秒默认值。
+func TestReplyAckTimeoutDefaultsToFiveSeconds(t *testing.T) {
+	client := NewWSClient(WSClientOptions{Logger: nopLogger()})
+	if client.wsManager.replyAckTimeout != 5000 {
+		t.Fatalf("reply ack timeout = %d, want 5000", client.wsManager.replyAckTimeout)
+	}
+	if client.options.ReplyAckTimeout != 5000 {
+		t.Fatalf("options.ReplyAckTimeout = %d, want 5000", client.options.ReplyAckTimeout)
+	}
 }
 
 // TestHandlerRegistrationDataRace 验证 Connect 后注册/更换 handler 与消息分发并发安全

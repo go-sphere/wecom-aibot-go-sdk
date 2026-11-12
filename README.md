@@ -116,6 +116,7 @@ func main() {
 | `MaxReconnectAttempts` | `int` | — | `10` | 最大重连次数（`-1` 表示无限重连） |
 | `HeartbeatInterval` | `int` | — | `30000` | 心跳间隔（毫秒） |
 | `RequestTimeout` | `int` | — | `10000` | HTTP 请求超时时间（毫秒） |
+| `ReplyAckTimeout` | `int` | — | `5000` | 回复回执超时（毫秒），适用于 `Reply*` 与 `UploadMedia` 等所有等待回执的发送 |
 | `WSURL` | `string` | — | `wss://openws.work.weixin.qq.com` | 自定义 WebSocket 连接地址 |
 | `WsDialer` | `*websocket.Dialer` | — | `nil` | 自定义 WebSocket Dialer（如 TLS 配置等） |
 | `Logger` | `Logger` | — | `DefaultLogger` | 自定义日志实例 |

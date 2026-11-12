@@ -636,7 +636,8 @@ type WSClientOptions struct {
 	MaxReconnectAttempts   int               // 连接断开时的最大重连次数，默认 10，负数（如 -1）表示无限
 	MaxAuthFailureAttempts int               // 认证失败时的最大重试次数，默认 5，负数（如 -1）表示无限
 	HeartbeatInterval      int               // 心跳间隔（毫秒），默认 30000；连续 2 次心跳无回执视为连接断开
-	RequestTimeout         int               // HTTP 请求（文件下载）超时（毫秒），默认 10000；不影响回复的 5 秒回执超时
+	RequestTimeout         int               // HTTP 请求（文件下载）超时（毫秒），默认 10000；不影响 ReplyAckTimeout
+	ReplyAckTimeout        int               // 回复回执超时（毫秒），默认 5000；适用于所有等待回执的发送
 	WSURL                  string            // 自定义 WebSocket 地址，默认 wss://openws.work.weixin.qq.com
 	WsDialer               *websocket.Dialer // 自定义 WebSocket Dialer（如 TLS 配置等），nil 时使用零值 Dialer
 	MaxReplyQueueSize      int               // 单个 req_id 的回复队列最大长度，默认 500，超出时新回复直接返回错误
@@ -650,6 +651,7 @@ type RequiredWSClientOptions struct {
 	MaxAuthFailureAttempts int
 	HeartbeatInterval      int
 	RequestTimeout         int
+	ReplyAckTimeout        int
 	MaxReplyQueueSize      int
 	WSURL                  string
 }
@@ -662,6 +664,7 @@ var DefaultWSClientOptions = RequiredWSClientOptions{
 	MaxAuthFailureAttempts: 5,
 	HeartbeatInterval:      30000,
 	RequestTimeout:         10000,
+	ReplyAckTimeout:        5000,
 	MaxReplyQueueSize:      500,
 	WSURL:                  "wss://openws.work.weixin.qq.com",
 }

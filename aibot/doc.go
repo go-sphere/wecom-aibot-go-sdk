@@ -47,7 +47,7 @@
 //
 // # 回复与发送
 //
-// 被动回复（Reply 系列）必须使用收到的回调帧，同一 req_id 的回复按调用顺序串行发送，每条都阻塞等待服务端回执（最长 5 秒）。流式回复用同一个 streamID 多次调用
+// 被动回复（Reply 系列）必须使用收到的回调帧，同一 req_id 的回复按调用顺序串行发送，每条都阻塞等待服务端回执（最长 ReplyAckTimeout，默认 5 秒）。流式回复用同一个 streamID 多次调用
 // [WSClient.ReplyStream]，最后一次传 finish=true；高频中间帧可用
 // [WSClient.ReplyStreamNonBlocking] 跳过仍在等待回执的发送。主动推送使用
 // [WSClient.SendMessage]、[WSClient.SendMarkdown]、[WSClient.SendTemplateCard]；媒体先用 [WSClient.UploadMedia] 上传，再用 [WSClient.ReplyMedia] 或

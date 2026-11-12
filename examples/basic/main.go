@@ -132,7 +132,7 @@ func main() {
 		stream := ai.Messages.NewStreaming(context.Background(), params)
 
 		// 使用 goroutine + ticker 解耦 token 累积与 WS 发送
-		// ReplyStream 是阻塞的（等待 ACK 最多 5 秒），不能在每个 token 上调用
+		// ReplyStream 是阻塞的（等待 ACK 的时间由 ReplyAckTimeout 决定，默认 5 秒），不能在每个 token 上调用
 		var (
 			mu          sync.Mutex
 			fullContent string
