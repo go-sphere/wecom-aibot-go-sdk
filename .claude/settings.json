@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(golangci-lint run:*)",
-      "mcp__MiniMax__web_search"
-    ]
-  }
-}

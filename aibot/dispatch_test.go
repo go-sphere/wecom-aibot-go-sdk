@@ -110,7 +110,7 @@ func TestDispatchBurstPreservesFramesAndReplyAcks(t *testing.T) {
 	awaitDispatch(t, entered)
 	// Run this like the socket reader: it must reach the ack despite the backlog.
 	acked := make(chan struct{}, 1)
-	m.addPendingAck("reply-probe", func(*WsFrame) { acked <- struct{}{} }, func(err error) {
+	m.addPendingAck("reply-probe", 0, func(*WsFrame) { acked <- struct{}{} }, func(err error) {
 		t.Errorf("reply failed while callbacks were queued: %v", err)
 	})
 	go func() {

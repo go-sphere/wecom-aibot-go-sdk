@@ -56,7 +56,13 @@ type OnErrorFunc func(err error)
 // 回复队列项
 // ============================================================================
 
+type replyResult struct {
+	frame *WsFrame
+	err   error
+}
+
 type replyQueueItem struct {
+	seq     uint64
 	frame   WsFrame
 	resolve func(*WsFrame)
 	reject  func(error)
@@ -207,13 +213,15 @@ func (m *WsConnectionManager) SetCredentials(botID, botSecret string, extraAuthP
 }
 
 // SetReplyAckTimeout 设置回复回执超时（毫秒），默认 5000；timeoutMs <= 0 时恢复默认值。
-// 适用于所有通过 SendReply 等待回执的请求（Reply 系列、UploadMedia 等）。需在 Connect
-// 之前调用，之后修改不是并发安全的；WSClient 通过 WSClientOptions.ReplyAckTimeout 设置。
+// 适用于所有通过 SendReply 等待回执的请求（Reply 系列、UploadMedia 等）。可并发调用；
+// WSClient 通过 WSClientOptions.ReplyAckTimeout 设置。
 func (m *WsConnectionManager) SetReplyAckTimeout(timeoutMs int) {
 	if timeoutMs <= 0 {
 		timeoutMs = defaultReplyAckTimeoutMs
 	}
+	m.pendingAcksMu.Lock()
 	m.replyAckTimeout = timeoutMs
+	m.pendingAcksMu.Unlock()
 }
 
 // Connect 建立 WebSocket 连接
@@ -428,19 +436,15 @@ func (m *WsConnectionManager) handleMessage(data []byte, dispatcher *callbackDis
 
 // isDisconnectedEvent 检测是否为 disconnected_event
 func (m *WsConnectionManager) isDisconnectedEvent(frame *WsFrame) bool {
-	if frame.Body == nil {
+	if frame == nil || frame.Body == nil {
 		return false
 	}
 	var bodyMap map[string]interface{}
 	if err := json.Unmarshal(frame.Body, &bodyMap); err != nil {
 		return false
 	}
-	eventRaw, ok := bodyMap["event"]
-	if !ok {
-		return false
-	}
-	eventMap, ok := eventRaw.(map[string]interface{})
-	if !ok {
+	eventMap, err := extractEventMap(bodyMap)
+	if err != nil {
 		return false
 	}
 	eventType, _ := eventMap["eventtype"].(string)
@@ -585,10 +589,20 @@ func (m *WsConnectionManager) heartbeatLoop(stop <-chan struct{}) {
 
 // startHeartbeat 启动心跳
 func (m *WsConnectionManager) startHeartbeat() {
-	m.stopHeartbeat()
+	m.heartbeatMu.Lock()
+	if m.heartbeatStop != nil {
+		close(m.heartbeatStop)
+		m.heartbeatStop = nil
+	}
+	if m.isManualClosed() || m.getConn() == nil {
+		m.heartbeatMu.Unlock()
+		return
+	}
 
 	stop := make(chan struct{})
 	m.heartbeatStop = stop
+	m.heartbeatMu.Unlock()
+
 	go m.heartbeatLoop(stop)
 
 	m.logger.Debug("Heartbeat started, interval: %dms", m.heartbeatInterval)
@@ -602,6 +616,25 @@ func (m *WsConnectionManager) stopHeartbeat() {
 		m.heartbeatStop = nil
 	}
 	m.heartbeatMu.Unlock()
+}
+
+// calcReconnectDelay 计算指数退避重连延迟（毫秒），上限为 reconnectMaxDelay。
+// 使用有界倍增循环代替位移运算，避免 attempt 较大时发生有符号整型溢出。
+func calcReconnectDelay(baseDelay, attempt int) int {
+	if baseDelay <= 0 {
+		return 0
+	}
+	if baseDelay >= reconnectMaxDelay {
+		return reconnectMaxDelay
+	}
+	delay := baseDelay
+	for i := 1; i < attempt; i++ {
+		if delay > reconnectMaxDelay/2 {
+			return reconnectMaxDelay
+		}
+		delay *= 2
+	}
+	return delay
 }
 
 // scheduleReconnect 安排重连
@@ -650,10 +683,7 @@ func (m *WsConnectionManager) scheduleReconnect() {
 	*attempts++
 	attempt := *attempts
 
-	delay := m.reconnectBaseDelay * (1 << (attempt - 1))
-	if delay > reconnectMaxDelay {
-		delay = reconnectMaxDelay
-	}
+	delay := calcReconnectDelay(m.reconnectBaseDelay, attempt)
 
 	if m.lastCloseWasAuthFailure {
 		m.logger.Info("Auth failed, reconnecting in %dms (auth attempt %d/%d)...", delay, attempt, maxAttempts)
@@ -749,31 +779,29 @@ func (m *WsConnectionManager) SendReply(reqID string, body interface{}, cmd stri
 		Body: bodyJSON,
 	}
 
-	// 放入队列
+	// 单次缓冲 channel + sync.Once，保证 resolve/reject 至多触发一次且永不阻塞
+	done := make(chan replyResult, 1)
+	var finishOnce sync.Once
+	finish := func(ack *WsFrame, err error) {
+		finishOnce.Do(func() {
+			done <- replyResult{frame: ack, err: err}
+		})
+	}
+
 	item := replyQueueItem{
 		frame: frame,
-	}
-
-	// 使用 channel 来实现异步等待
-	resultChan := make(chan *WsFrame, 1)
-	errChan := make(chan error, 1)
-
-	item.resolve = func(ack *WsFrame) {
-		resultChan <- ack
-	}
-	item.reject = func(err error) {
-		errChan <- err
+		resolve: func(ack *WsFrame) {
+			finish(ack, nil)
+		},
+		reject: func(err error) {
+			finish(nil, err)
+		},
 	}
 
 	m.enqueueReply(reqID, item)
 
-	// 等待结果
-	select {
-	case ack := <-resultChan:
-		return ack, nil
-	case err := <-errChan:
-		return nil, err
-	}
+	res := <-done
+	return res.frame, res.err
 }
 
 // enqueueReply 将回复放入队列
@@ -781,19 +809,16 @@ func (m *WsConnectionManager) enqueueReply(reqID string, item replyQueueItem) {
 	m.replyQueuesMu.Lock()
 	defer m.replyQueuesMu.Unlock()
 
-	if _, ok := m.replyQueues[reqID]; !ok {
-		m.replyQueues[reqID] = []replyQueueItem{}
-	}
-
 	queue := m.replyQueues[reqID]
 
-	// 防止队列无限增长
+	// 防止队列无限增长（先检查上限，再插入 map）
 	if len(queue) >= m.maxReplyQueueSize {
 		m.logger.Warn("Reply queue for reqId %s exceeds max size (%d), rejecting new message", reqID, m.maxReplyQueueSize)
 		item.reject(fmt.Errorf("reply queue for reqId %s exceeds max size", reqID))
 		return
 	}
 
+	item.seq = atomic.AddUint64(&m.pendingAckSeq, 1)
 	queue = append(queue, item)
 	m.replyQueues[reqID] = queue
 
@@ -801,6 +826,24 @@ func (m *WsConnectionManager) enqueueReply(reqID string, item replyQueueItem) {
 	if len(queue) == 1 {
 		go m.processReplyQueue(reqID)
 	}
+}
+
+// dequeueReplyHeadLocked must be called with m.replyQueuesMu held.
+// It removes q[0] only when it still matches seq, zeroes the vacated slot to
+// avoid retaining callbacks, and deletes empty map entries.
+func (m *WsConnectionManager) dequeueReplyHeadLocked(reqID string, seq uint64) bool {
+	q, exists := m.replyQueues[reqID]
+	if !exists || len(q) == 0 || q[0].seq != seq {
+		return false
+	}
+	q[0] = replyQueueItem{}
+	q = q[1:]
+	if len(q) == 0 {
+		delete(m.replyQueues, reqID)
+		return false
+	}
+	m.replyQueues[reqID] = q
+	return true
 }
 
 // processReplyQueue 处理回复队列
@@ -813,6 +856,21 @@ func (m *WsConnectionManager) processReplyQueue(reqID string) {
 	}
 
 	item := queue[0]
+	// 在 Send 之前注册 pendingAck，避免极快回执在 Send 返回前到达读协程而丢失；
+	// 并在锁内校验 item 仍是队首且尚未注册，防止并发重复发送或与 clearPendingMessages 竞态。
+	m.pendingAcksMu.Lock()
+	if q, stillOK := m.replyQueues[reqID]; !stillOK || len(q) == 0 || q[0].seq != item.seq {
+		m.pendingAcksMu.Unlock()
+		m.replyQueuesMu.Unlock()
+		return
+	}
+	if _, exists := m.pendingAcks[reqID]; exists {
+		m.pendingAcksMu.Unlock()
+		m.replyQueuesMu.Unlock()
+		return
+	}
+	m.addPendingAckLocked(reqID, item.seq, item.resolve, item.reject)
+	m.pendingAcksMu.Unlock()
 	m.replyQueuesMu.Unlock()
 
 	// 发送帧
@@ -820,35 +878,42 @@ func (m *WsConnectionManager) processReplyQueue(reqID string) {
 		m.logger.Error("Failed to send reply for reqId %s: %s", reqID, err.Error())
 
 		m.replyQueuesMu.Lock()
-		if q, exists := m.replyQueues[reqID]; exists && len(q) > 0 {
-			m.replyQueues[reqID] = q[1:]
+		m.pendingAcksMu.Lock()
+		if pending, exists := m.pendingAcks[reqID]; exists && pending.seq == item.seq {
+			pending.timer.Stop()
+			delete(m.pendingAcks, reqID)
 		}
+		hasMore := m.dequeueReplyHeadLocked(reqID, item.seq)
+		m.pendingAcksMu.Unlock()
 		m.replyQueuesMu.Unlock()
 
 		item.reject(err)
-		// 异步继续处理下一条，避免同步递归栈溢出
-		go m.processReplyQueue(reqID)
+		if hasMore {
+			// 异步继续处理下一条，避免同步递归栈溢出
+			go m.processReplyQueue(reqID)
+		}
 		return
 	}
 
 	m.logger.Debug("Reply message sent via WebSocket, reqId: %s", reqID)
-
-	// 设置回执超时
-	m.addPendingAck(reqID, item.resolve, item.reject)
 }
 
 // addPendingAck 添加待回执项
-func (m *WsConnectionManager) addPendingAck(reqID string, resolve func(*WsFrame), reject func(error)) {
+func (m *WsConnectionManager) addPendingAck(reqID string, seq uint64, resolve func(*WsFrame), reject func(error)) {
 	m.pendingAcksMu.Lock()
 	defer m.pendingAcksMu.Unlock()
+	m.addPendingAckLocked(reqID, seq, resolve, reject)
+}
 
+func (m *WsConnectionManager) addPendingAckLocked(reqID string, seq uint64, resolve func(*WsFrame), reject func(error)) {
 	// 如果已存在，先清理
 	if existing, ok := m.pendingAcks[reqID]; ok {
 		existing.timer.Stop()
 	}
 
-	// 分配唯一序列号，用于超时回调中校验是否是当前 pending
-	seq := atomic.AddUint64(&m.pendingAckSeq, 1)
+	if seq == 0 {
+		seq = atomic.AddUint64(&m.pendingAckSeq, 1)
+	}
 	timeoutMs := m.replyAckTimeout
 
 	timer := time.AfterFunc(
@@ -877,26 +942,20 @@ func (m *WsConnectionManager) hasPendingAck(reqID string) bool {
 
 // handleReplyAck 处理回复回执
 func (m *WsConnectionManager) handleReplyAck(reqID string, frame *WsFrame) {
+	m.replyQueuesMu.Lock()
 	m.pendingAcksMu.Lock()
 	pending, ok := m.pendingAcks[reqID]
 	if !ok {
 		m.pendingAcksMu.Unlock()
+		m.replyQueuesMu.Unlock()
 		return
 	}
 
-	// 清除超时定时器
+	// 清除超时定时器并从队列移除队首
 	pending.timer.Stop()
 	delete(m.pendingAcks, reqID)
+	m.dequeueReplyHeadLocked(reqID, pending.seq)
 	m.pendingAcksMu.Unlock()
-
-	// 从队列中移除
-	m.replyQueuesMu.Lock()
-	if q, exists := m.replyQueues[reqID]; exists && len(q) > 0 {
-		m.replyQueues[reqID] = q[1:]
-		if len(m.replyQueues[reqID]) == 0 {
-			delete(m.replyQueues, reqID)
-		}
-	}
 	m.replyQueuesMu.Unlock()
 
 	if frame.ErrCode != 0 {
@@ -913,33 +972,21 @@ func (m *WsConnectionManager) handleReplyAck(reqID string, frame *WsFrame) {
 
 // handleReplyAckTimeout 处理回复超时
 func (m *WsConnectionManager) handleReplyAckTimeout(reqID string, seq uint64) {
+	m.replyQueuesMu.Lock()
 	m.pendingAcksMu.Lock()
 	pending, ok := m.pendingAcks[reqID]
-	if !ok {
+	if !ok || pending.seq != seq {
 		m.pendingAcksMu.Unlock()
-		return
-	}
-
-	// 校验 seq：如果不匹配，说明这是过期的超时回调，直接忽略
-	if pending.seq != seq {
-		m.pendingAcksMu.Unlock()
+		m.replyQueuesMu.Unlock()
 		return
 	}
 
 	delete(m.pendingAcks, reqID)
+	m.dequeueReplyHeadLocked(reqID, seq)
 	m.pendingAcksMu.Unlock()
+	m.replyQueuesMu.Unlock()
 
 	m.logger.Warn("Reply ack timeout (%dms) for reqId: %s", pending.timeout, reqID)
-
-	// 从队列中移除
-	m.replyQueuesMu.Lock()
-	if q, exists := m.replyQueues[reqID]; exists && len(q) > 0 {
-		m.replyQueues[reqID] = q[1:]
-		if len(m.replyQueues[reqID]) == 0 {
-			delete(m.replyQueues, reqID)
-		}
-	}
-	m.replyQueuesMu.Unlock()
 
 	pending.reject(fmt.Errorf("reply ack timeout (%dms) for reqId: %s", pending.timeout, reqID))
 
@@ -949,30 +996,41 @@ func (m *WsConnectionManager) handleReplyAckTimeout(reqID string, seq uint64) {
 
 // clearPendingMessages 清理所有待处理的消息
 func (m *WsConnectionManager) clearPendingMessages(reason string) {
-	// 收集所有已在 pendingAcks 中的 reject 函数引用，用于后续去重
-	pendingRejects := make(map[*func(error)]struct{})
-
-	m.pendingAcksMu.Lock()
-	for reqID, pending := range m.pendingAcks {
-		pending.timer.Stop()
-		pendingRejects[&pending.reject] = struct{}{}
-		pending.reject(fmt.Errorf("%s, reply for reqId: %s cancelled", reason, reqID))
+	type cancelledReply struct {
+		reqID  string
+		reject func(error)
 	}
-	m.pendingAcks = make(map[string]*pendingAck)
-	m.pendingAcksMu.Unlock()
+	var toReject []cancelledReply
+	pendingSeqs := make(map[uint64]struct{})
 
 	m.replyQueuesMu.Lock()
+	m.pendingAcksMu.Lock()
+
+	for reqID, pending := range m.pendingAcks {
+		pending.timer.Stop()
+		pendingSeqs[pending.seq] = struct{}{}
+		toReject = append(toReject, cancelledReply{reqID: reqID, reject: pending.reject})
+	}
+	m.pendingAcks = make(map[string]*pendingAck)
+
 	for reqID, queue := range m.replyQueues {
 		for _, item := range queue {
-			// 跳过已经在 pendingAcks 中被 reject 过的队首 item，避免双重 reject
-			if _, alreadyRejected := pendingRejects[&item.reject]; alreadyRejected {
+			// 跳过已经在 pendingAcks 中记录过的队首 item，避免双重 reject
+			if _, alreadyRejected := pendingSeqs[item.seq]; alreadyRejected {
 				continue
 			}
-			item.reject(fmt.Errorf("%s, reply for reqId: %s cancelled", reason, reqID))
+			pendingSeqs[item.seq] = struct{}{}
+			toReject = append(toReject, cancelledReply{reqID: reqID, reject: item.reject})
 		}
 	}
 	m.replyQueues = make(map[string][]replyQueueItem)
+
+	m.pendingAcksMu.Unlock()
 	m.replyQueuesMu.Unlock()
+
+	for _, c := range toReject {
+		c.reject(fmt.Errorf("%s, reply for reqId: %s cancelled", reason, c.reqID))
+	}
 }
 
 // Disconnect 断开连接

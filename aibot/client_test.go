@@ -14,8 +14,10 @@ func TestSendMessageInvalidBody(t *testing.T) {
 	defer cleanup()
 
 	client := NewWSClient(WSClientOptions{
-		WSURL: url,
+		WSURL:  url,
+		Logger: nopLogger(),
 	})
+	defer client.Disconnect()
 	client.Connect()
 	waitConnected(t, client.wsManager)
 	mc := <-connCh
@@ -35,8 +37,10 @@ func TestSendMessageInvalidBody(t *testing.T) {
 	}
 
 	// 合法对象 body：应正常入队发送（由服务端收到）
+	sendErr := make(chan error, 1)
 	go func() {
-		_, _ = client.SendMessage("chat-1", CreateTextReplyBody("hi"))
+		_, err := client.SendMessage("chat-1", CreateTextReplyBody("hi"))
+		sendErr <- err
 	}()
 	sent := readServerFrame(t, mc)
 	if sent.Cmd != WsCmd.SEND_MSG {
@@ -51,6 +55,9 @@ func TestSendMessageInvalidBody(t *testing.T) {
 	}
 	// 回执避免 goroutine 泄漏
 	mc.write(t, WsFrame{Headers: WsFrameHeaders{ReqID: sent.Headers.ReqID}})
+	if err := <-sendErr; err != nil {
+		t.Fatalf("SendMessage failed: %v", err)
+	}
 }
 
 // TestReplyAckTimeoutOption 验证 WSClientOptions.ReplyAckTimeout 作用于实际等待回执的发送。
@@ -63,6 +70,7 @@ func TestReplyAckTimeoutOption(t *testing.T) {
 		ReplyAckTimeout: 100,
 		Logger:          nopLogger(),
 	})
+	defer client.Disconnect()
 	client.Connect()
 	waitConnected(t, client.wsManager)
 	mc := <-connCh
@@ -98,7 +106,8 @@ func TestHandlerRegistrationDataRace(t *testing.T) {
 	url, connCh, cleanup := startWSMirror(t)
 	defer cleanup()
 
-	client := NewWSClient(WSClientOptions{WSURL: url})
+	client := NewWSClient(WSClientOptions{WSURL: url, Logger: nopLogger()})
+	defer client.Disconnect()
 	calls := make(chan string, 128)
 	client.OnMessageText(func(frame *WsFrame) {
 		calls <- "old"
@@ -140,4 +149,67 @@ func TestHandlerRegistrationDataRace(t *testing.T) {
 func jsonMarshal(v interface{}) []byte {
 	data, _ := json.Marshal(v)
 	return data
+}
+
+func TestClientNilGuardsAndEmptyUpload(t *testing.T) {
+	client := NewWSClient(WSClientOptions{Logger: nopLogger()})
+
+	if _, err := client.Reply(nil, CreateTextReplyBody("hi"), ""); err == nil {
+		t.Fatal("Reply(nil) succeeded, want error")
+	}
+	if client.HasPendingReplyAck(nil) {
+		t.Fatal("HasPendingReplyAck(nil) = true, want false")
+	}
+	if _, err := client.ReplyStreamNonBlocking(nil, "stream-1", "hi", false, nil, nil); err == nil {
+		t.Fatal("ReplyStreamNonBlocking(nil) succeeded, want error")
+	}
+	if _, err := client.UploadMedia(nil, UploadMediaOptions{Type: WeComMediaTypeFile, Filename: "a.txt"}); err == nil {
+		t.Fatal("UploadMedia(nil) succeeded, want error")
+	}
+	if _, err := client.UploadMedia([]byte{}, UploadMediaOptions{Type: WeComMediaTypeFile, Filename: "a.txt"}); err == nil {
+		t.Fatal("UploadMedia(empty) succeeded, want error")
+	}
+}
+
+func TestGetEventTypeAndStringEncodedEvent(t *testing.T) {
+	objFrame := &WsFrame{
+		Cmd:  WsCmd.EVENT_CALLBACK,
+		Body: json.RawMessage(`{"msgtype":"event","event":{"eventtype":"enter_chat"}}`),
+	}
+	if got := GetEventType(objFrame); got != "enter_chat" {
+		t.Fatalf("GetEventType(object) = %q, want enter_chat", got)
+	}
+
+	strFrame := &WsFrame{
+		Cmd:  WsCmd.EVENT_CALLBACK,
+		Body: json.RawMessage(`{"msgtype":"event","event":"{\"eventtype\":\"disconnected_event\"}"}`),
+	}
+	if got := GetEventType(strFrame); got != "disconnected_event" {
+		t.Fatalf("GetEventType(string) = %q, want disconnected_event", got)
+	}
+
+	mgr := silentManager()
+	defer mgr.Disconnect()
+	if !mgr.isDisconnectedEvent(strFrame) {
+		t.Fatal("isDisconnectedEvent(string) = false, want true")
+	}
+
+	var gotEvent string
+	client := NewWSClient(WSClientOptions{Logger: nopLogger()})
+	client.OnEventEnterChat(func(f *WsFrame) {
+		gotEvent = GetEventType(f)
+	})
+	client.messageHandler.HandleFrame(objFrame, client)
+	if gotEvent != "enter_chat" {
+		t.Fatalf("OnEventEnterChat did not fire for object event, got %q", gotEvent)
+	}
+}
+
+func TestGenerateRandomStringLengths(t *testing.T) {
+	for _, length := range []int{0, 1, 2, 7, 8, 32} {
+		s := GenerateRandomString(length)
+		if len(s) != length {
+			t.Fatalf("GenerateRandomString(%d) returned length %d (%q)", length, len(s), s)
+		}
+	}
 }

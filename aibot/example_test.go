@@ -71,7 +71,7 @@ func Example() {
 			replyErr <- err
 			return
 		}
-		// 回调运行在读协程上，回复需在新协程中进行，否则读不到回执。
+		// 消息回调在独立分发协程上执行，可直接同步等待回执；这里放到新协程中演示异步回复流程。
 		go func() {
 			streamID := "stream_" + frame.Headers.ReqID
 			_, err := client.ReplyStream(frame, streamID, msg.From.UserID+" said: "+msg.Text.Content, true, nil, nil)

@@ -1,5 +1,6 @@
 GO ?= go
 GOLANGCI_LINT ?= golangci-lint
+NILAWAY ?= nilaway
 
 GO_MOD_DIRS := . examples/basic examples/agent
 DIRECT_DEPS_TEMPLATE := {{if and (not .Main) (not .Indirect) (not .Replace)}}{{.Path}}{{end}}
@@ -70,7 +71,8 @@ lint:
 		( cd "$$dir"; \
 		  $(GOLANGCI_LINT) fmt --no-config --enable gofmt --enable goimports --diff; \
 		  $(GO) vet ./...; \
-		  $(GOLANGCI_LINT) run --no-config ); \
+		  $(GOLANGCI_LINT) run --no-config; \
+		  $(NILAWAY) -include-pkgs="$$(GOWORK=off $(GO) list -m)" ./... ); \
 	done
 
 check: tidy-check

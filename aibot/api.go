@@ -6,6 +6,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,10 +27,13 @@ type WeComApiClient struct {
 }
 
 // NewWeComApiClient 创建 API 客户端
-// timeout 为 HTTP 请求超时（毫秒），<= 0 时使用 10000；logger 不能为 nil。
+// timeout 为 HTTP 请求超时（毫秒），<= 0 时使用 10000；logger 为 nil 时使用 NewDefaultLogger。
 func NewWeComApiClient(logger Logger, timeout int) *WeComApiClient {
 	if timeout <= 0 {
 		timeout = 10000
+	}
+	if logger == nil {
+		logger = NewDefaultLogger()
 	}
 
 	client := &http.Client{
@@ -53,6 +57,9 @@ func (c *WeComApiClient) DownloadFileRaw(fileURL string) (*FileResult, error) {
 		c.logger.Error("File download failed: %s", err.Error())
 		return nil, err
 	}
+	if resp == nil {
+		return nil, fmt.Errorf("file download failed: empty response")
+	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
 			c.logger.Error("Failed to close response body: %s", err.Error())
@@ -61,8 +68,8 @@ func (c *WeComApiClient) DownloadFileRaw(fileURL string) (*FileResult, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		c.logger.Error("File download failed, status: %s", resp.Status)
-		// 排空响应体以便复用底层连接，并返回明确错误而非 (nil, nil)
-		_, _ = io.Copy(io.Discard, resp.Body)
+		// 有限排空响应体以便复用小错误响应的底层连接，同时避免大响应体无限阻塞
+		_, _ = io.CopyN(io.Discard, resp.Body, 4096)
 		return nil, fmt.Errorf("file download failed with status %s", resp.Status)
 	}
 
@@ -90,34 +97,37 @@ func parseFilename(contentDisposition string) string {
 		return ""
 	}
 
-	// 优先匹配 filename*=UTF-8''xxx 格式 (RFC 5987)
-	if strings.Contains(contentDisposition, "filename*=") {
-		// 尝试解析 filename*=UTF-8''
-		parts := strings.Split(contentDisposition, "filename*=")
-		if len(parts) > 1 {
-			value := strings.TrimSpace(parts[1])
-			// 可能是 UTF-8''xxx 格式
-			if idx := strings.Index(value, "''"); idx != -1 {
-				encodedName := value[idx+2:]
-				decoded, err := url.QueryUnescape(encodedName)
-				if err == nil {
-					return decoded
-				}
-			}
+	if _, params, err := mime.ParseMediaType(contentDisposition); err == nil {
+		if filename := params["filename"]; filename != "" {
+			return filename
 		}
 	}
 
-	// 匹配 filename="xxx" 或 filename=xxx 格式
-	// 先去掉可能存在的多个 filename= 的情况，取最后一个
+	// 兜底解析非标准 Content-Disposition（如缺少 disposition type 或未加引号的空格）
+	if idx := strings.Index(contentDisposition, "filename*="); idx != -1 {
+		value := strings.TrimSpace(contentDisposition[idx+len("filename*="):])
+		if semi := strings.Index(value, ";"); semi != -1 {
+			value = value[:semi]
+		}
+		value = strings.Trim(strings.TrimSpace(value), `"`)
+		if quoteIdx := strings.Index(value, "''"); quoteIdx != -1 {
+			encodedName := value[quoteIdx+2:]
+			if decoded, err := url.PathUnescape(encodedName); err == nil {
+				return decoded
+			}
+			return encodedName
+		}
+	}
+
+	// 匹配 filename="xxx" 或 filename=xxx 格式（取最后一个）
 	parts := strings.Split(contentDisposition, "filename=")
 	if len(parts) > 1 {
 		lastPart := parts[len(parts)-1]
-		// 去掉引号和分号
-		lastPart = strings.Trim(lastPart, "\"; ")
-		// 处理可能还有引号的情况
-		lastPart = strings.Trim(lastPart, "\"")
-		decoded, err := url.QueryUnescape(lastPart)
-		if err == nil {
+		if semi := strings.Index(lastPart, ";"); semi != -1 {
+			lastPart = lastPart[:semi]
+		}
+		lastPart = strings.Trim(strings.TrimSpace(lastPart), `"`)
+		if decoded, err := url.PathUnescape(lastPart); err == nil {
 			return decoded
 		}
 		return lastPart
@@ -127,39 +137,27 @@ func parseFilename(contentDisposition string) string {
 }
 
 // GetFilenameFromURL 从 URL 解析文件名
-// 优先取路径的最后一段并做 URL 解码；URL 无法解析时返回空字符串。
+// 优先取路径的最后一段并做 URL 路径解码；路径无文件名时回退到 filename 查询参数；URL 无法解析时返回空字符串。
 func GetFilenameFromURL(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
+	parsedURL, err := url.Parse(rawURL)
 	if err != nil {
 		return ""
 	}
 
 	// 尝试从路径获取
-	filename := filepath.Base(parsed.Path)
-	if filename != "" && filename != "/" {
-		// 去除查询参数
-		if idx := strings.Index(filename, "?"); idx != -1 {
-			filename = filename[:idx]
-		}
-		// 尝试解码
-		decoded, err := url.QueryUnescape(filename)
-		if err == nil {
+	filename := path.Base(parsedURL.Path)
+	if filename != "" && filename != "." && filename != "/" {
+		if decoded, err := url.PathUnescape(filename); err == nil {
 			filename = decoded
 		}
-		return filename
-	}
-
-	// 尝试从 Content-Type 获取扩展名
-	ext := filepath.Ext(filename)
-	if ext != "" {
-		return filename
+		if filename != "" && filename != "." && filename != "/" {
+			return filename
+		}
 	}
 
 	// 尝试从查询参数获取
-	query := parsed.Query()
-	if filename := query.Get("filename"); filename != "" {
-		decoded, _ := url.QueryUnescape(filename)
-		return decoded
+	if filename := parsedURL.Query().Get("filename"); filename != "" {
+		return filename
 	}
 
 	return ""

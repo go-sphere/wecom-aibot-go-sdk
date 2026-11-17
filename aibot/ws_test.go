@@ -2,6 +2,9 @@ package aibot
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"strconv"
@@ -331,9 +334,11 @@ func TestAuthFailureExhaustionStopsReconnect(t *testing.T) {
 
 	// maxAuthFailureAttempts = 2，重连基延迟 1ms 便于快速耗尽
 	mgr := NewWsConnectionManager(nopLogger(), 30000, 1, 10, url, nil, 500, 2)
+	defer mgr.Disconnect()
 	exhausted := make(chan error, 1)
 	mgr.OnError = func(err error) {
-		if _, ok := err.(*WSAuthFailureError); ok {
+		var authErr *WSAuthFailureError
+		if errors.As(err, &authErr) {
 			select {
 			case exhausted <- err:
 			default:
@@ -570,5 +575,273 @@ func TestStaleReconnectTimerDoesNotDisturbNewLifecycle(t *testing.T) {
 	}
 	if !mgr.IsConnected() {
 		t.Fatal("stale reconnect timer closed the connection of the new lifecycle")
+	}
+}
+
+func TestCalcReconnectDelay(t *testing.T) {
+	tests := []struct {
+		name      string
+		baseDelay int
+		attempt   int
+		want      int
+	}{
+		{name: "attempt 1", baseDelay: 1000, attempt: 1, want: 1000},
+		{name: "attempt 2", baseDelay: 1000, attempt: 2, want: 2000},
+		{name: "attempt 3", baseDelay: 1000, attempt: 3, want: 4000},
+		{name: "attempt 5", baseDelay: 1000, attempt: 5, want: 16000},
+		{name: "attempt 6 capped", baseDelay: 1000, attempt: 6, want: reconnectMaxDelay},
+		{name: "attempt 55", baseDelay: 1000, attempt: 55, want: reconnectMaxDelay},
+		{name: "attempt 64", baseDelay: 1000, attempt: 64, want: reconnectMaxDelay},
+		{name: "attempt 65", baseDelay: 1000, attempt: 65, want: reconnectMaxDelay},
+		{name: "attempt 1000", baseDelay: 1000, attempt: 1000, want: reconnectMaxDelay},
+		{name: "attempt MaxInt", baseDelay: 1000, attempt: math.MaxInt, want: reconnectMaxDelay},
+		{name: "small base MaxInt", baseDelay: 1, attempt: math.MaxInt, want: reconnectMaxDelay},
+		{name: "base above max", baseDelay: 50000, attempt: 1, want: reconnectMaxDelay},
+		{name: "zero base", baseDelay: 0, attempt: 3, want: 0},
+		{name: "negative base", baseDelay: -100, attempt: 3, want: 0},
+		{name: "zero attempt", baseDelay: 1000, attempt: 0, want: 1000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := calcReconnectDelay(tt.baseDelay, tt.attempt); got != tt.want {
+				t.Fatalf("calcReconnectDelay(%d, %d) = %d, want %d", tt.baseDelay, tt.attempt, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestDisconnectCancelsInFlightAndQueuedSendReply 验证 Disconnect 期间有正在等待 ack 的
+// SendReply（及同 reqID 排队的后续回复）时，所有调用均能立即返回错误，不会因双重 reject 阻塞或超时挂起。
+func TestDisconnectCancelsInFlightAndQueuedSendReply(t *testing.T) {
+	url, connCh, cleanup := startWSMirror(t)
+	defer cleanup()
+
+	mgr := newTestManager(t, url)
+	defer mgr.Disconnect()
+	mgr.SetReplyAckTimeout(5000)
+	mgr.Connect()
+	waitConnected(t, mgr)
+	mc := <-connCh
+	authOK(t, mc)
+
+	const total = 4
+	errs := make(chan error, total)
+	for i := range total {
+		go func(idx int) {
+			_, err := mgr.SendReply("req-inflight", map[string]interface{}{"seq": idx}, WsCmd.RESPONSE)
+			errs <- err
+		}(i)
+	}
+
+	// 等待第一条真正发出（确保处于 pendingAcks + replyQueues 混合状态）
+	sent := readServerFrame(t, mc)
+	if sent.Headers.ReqID != "req-inflight" {
+		t.Fatalf("unexpected sent reqID %q", sent.Headers.ReqID)
+	}
+
+	mgr.Disconnect()
+
+	for i := range total {
+		select {
+		case err := <-errs:
+			if err == nil {
+				t.Fatalf("SendReply #%d succeeded after Disconnect, want error", i)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("SendReply #%d hung after Disconnect", i)
+		}
+	}
+
+	mgr.replyQueuesMu.Lock()
+	qLen := len(mgr.replyQueues)
+	mgr.replyQueuesMu.Unlock()
+	mgr.pendingAcksMu.Lock()
+	ackLen := len(mgr.pendingAcks)
+	mgr.pendingAcksMu.Unlock()
+	if qLen != 0 || ackLen != 0 {
+		t.Fatalf("leftover state after Disconnect: replyQueues=%d pendingAcks=%d", qLen, ackLen)
+	}
+}
+
+// TestDisconnectSendReplyRace 并发触发 SendReply 与 Disconnect，验证 -race 下无数据竞争与死锁。
+func TestDisconnectSendReplyRace(t *testing.T) {
+	for range 20 {
+		mgr := silentManager()
+		mgr.SetReplyAckTimeout(200)
+		var wg sync.WaitGroup
+		for j := range 4 {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				_, _ = mgr.SendReply(fmt.Sprintf("req-%d", idx%2), map[string]interface{}{"msgtype": "text"}, WsCmd.RESPONSE)
+			}(j)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mgr.Disconnect()
+		}()
+		wg.Wait()
+	}
+}
+
+// TestSendReplyFastImmediateAck 验证极快回执在 Send 返回前到达时不会丢失，
+// 且排队回复均能按序拿到各自回执。
+func TestSendReplyFastImmediateAck(t *testing.T) {
+	conn := dialAckingConn(t)
+	mgr := silentManager()
+	defer mgr.Disconnect()
+	mgr.SetReplyAckTimeout(300)
+	mgr.setConn(conn)
+	mgr.setupEventHandlers()
+
+	const n = 25
+	errs := make(chan error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			reqID := fmt.Sprintf("fast-%d", idx%3)
+			ack, err := mgr.SendReply(reqID, map[string]interface{}{"idx": idx}, WsCmd.RESPONSE)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if ack == nil || ack.Headers.ReqID != reqID {
+				errs <- fmt.Errorf("unexpected ack %+v for %s", ack, reqID)
+				return
+			}
+			errs <- nil
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("fast immediate ack failed: %v", err)
+		}
+	}
+}
+
+// TestStartHeartbeatDisconnectRace 验证并发调用 startHeartbeat 与 Disconnect 时无数据竞争、无 panic。
+func TestStartHeartbeatDisconnectRace(t *testing.T) {
+	url, connCh, cleanup := startWSMirror(t)
+	defer cleanup()
+
+	mgr := newTestManager(t, url)
+	defer mgr.Disconnect()
+	mgr.heartbeatInterval = 15
+	mgr.Connect()
+	waitConnected(t, mgr)
+	mc := <-connCh
+	authOK(t, mc)
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			mgr.startHeartbeat()
+		}()
+		go func() {
+			defer wg.Done()
+			mgr.Disconnect()
+		}()
+	}
+	wg.Wait()
+
+	mgr.heartbeatMu.Lock()
+	stop := mgr.heartbeatStop
+	mgr.heartbeatMu.Unlock()
+	if mgr.isManualClosed() && stop != nil {
+		t.Fatal("heartbeatStop remained non-nil after Disconnect")
+	}
+}
+
+func TestEnqueueReplyMaxQueueDoesNotInsertEmptyEntry(t *testing.T) {
+	url, connCh, cleanup := startWSMirror(t)
+	defer cleanup()
+
+	mgr := NewWsConnectionManager(nopLogger(), 30000, 100, 0, url, nil, 1, 5)
+	defer mgr.Disconnect()
+	mgr.Connect()
+	waitConnected(t, mgr)
+	mc := <-connCh
+	authOK(t, mc)
+
+	// 占满容量为 1 的队列（不返回 ack 使其保持在队列头）
+	done1 := make(chan error, 1)
+	go func() {
+		_, err := mgr.SendReply("req-cap", map[string]interface{}{"n": 1}, WsCmd.RESPONSE)
+		done1 <- err
+	}()
+	sent := readServerFrame(t, mc)
+	if sent.Headers.ReqID != "req-cap" {
+		t.Fatalf("unexpected reqID %q", sent.Headers.ReqID)
+	}
+
+	// 第二条应立即因超出 maxReplyQueueSize 被拒绝
+	_, err := mgr.SendReply("req-cap", map[string]interface{}{"n": 2}, WsCmd.RESPONSE)
+	if err == nil || !strings.Contains(err.Error(), "exceeds max size") {
+		t.Fatalf("second SendReply err = %v, want exceeds max size", err)
+	}
+
+	mgr.Disconnect()
+	if err := <-done1; err == nil {
+		t.Fatal("first SendReply succeeded after Disconnect, want error")
+	}
+
+	// 验证上限为 0 时不会向 replyQueues 插入空条目
+	mgr2 := silentManager()
+	defer mgr2.Disconnect()
+	mgr2.maxReplyQueueSize = 0
+	if _, err := mgr2.SendReply("req-zero", map[string]interface{}{"n": 1}, WsCmd.RESPONSE); err == nil {
+		t.Fatal("SendReply succeeded with maxReplyQueueSize=0, want error")
+	}
+	mgr2.replyQueuesMu.Lock()
+	_, exists := mgr2.replyQueues["req-zero"]
+	mgr2.replyQueuesMu.Unlock()
+	if exists {
+		t.Fatal("rejected SendReply left an empty entry in replyQueues")
+	}
+}
+
+// TestProcessReplyQueueSendFailureCleansPendingAndQueue 验证 Send 失败时
+// pendingAcks 与空 replyQueues 条目均被清理，且后续排队消息继续推进并各自收到错误。
+func TestProcessReplyQueueSendFailureCleansPendingAndQueue(t *testing.T) {
+	mgr := silentManager()
+	defer mgr.Disconnect()
+	mgr.SetReplyAckTimeout(5000)
+
+	const total = 3
+	errs := make(chan error, total)
+	for range total {
+		go func() {
+			_, err := mgr.SendReply("req-send-fail", map[string]interface{}{"msgtype": "text"}, WsCmd.RESPONSE)
+			errs <- err
+		}()
+	}
+
+	for i := range total {
+		select {
+		case err := <-errs:
+			if err == nil {
+				t.Fatalf("SendReply #%d succeeded while disconnected, want error", i)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("SendReply #%d hung instead of failing immediately", i)
+		}
+	}
+
+	// processReplyQueue 在调用 item.reject(err) 之前已清理 pendingAcks 与 replyQueues
+	mgr.replyQueuesMu.Lock()
+	qLen := len(mgr.replyQueues)
+	mgr.replyQueuesMu.Unlock()
+	mgr.pendingAcksMu.Lock()
+	ackLen := len(mgr.pendingAcks)
+	mgr.pendingAcksMu.Unlock()
+	if qLen != 0 || ackLen != 0 {
+		t.Fatalf("leftover state after Send failure: replyQueues=%d pendingAcks=%d", qLen, ackLen)
 	}
 }

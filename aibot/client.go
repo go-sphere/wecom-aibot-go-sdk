@@ -617,9 +617,12 @@ func (c *WSClient) EmitEventDisconnected(frame *WsFrame) {
 //
 // frame 必须是收到的回调帧（不能为 nil），回复使用其 req_id；body 序列化为 JSON 作为帧的 body；cmd 为空时使用 WsCmd.RESPONSE。同一 req_id 的回复按调用顺序串行发送，Reply 阻塞直到服务端回执、ReplyAckTimeout 回执超时、连接断开或调用 Disconnect，排队等待的时间不计入超时。成功时返回回执帧。
 //
-// 以下情况返回错误：req_id 为空、body 无法序列化、连接未建立、该 req_id 排队数超过
-// MaxReplyQueueSize、回执超时、回执 errcode 非 0（错误信息包含 errcode），以及连接断开导致回复被取消。不要在消息回调中同步调用，见 MessageHandlerFunc。
+// 以下情况返回错误：frame 为 nil、req_id 为空、body 无法序列化、连接未建立、该 req_id 排队数超过
+// MaxReplyQueueSize、回执超时、回执 errcode 非 0（错误信息包含 errcode），以及连接断开导致回复被取消。可在 OnMessage*/OnEvent* 回调中同步调用（不能在 OnAuthenticated 中同步调用）；耗时场景可放到新协程中，见 MessageHandlerFunc。
 func (c *WSClient) Reply(frame *WsFrame, body interface{}, cmd string) (*WsFrame, error) {
+	if frame == nil {
+		return nil, fmt.Errorf("frame is nil")
+	}
 	reqID := frame.Headers.ReqID
 	if reqID == "" {
 		return nil, fmt.Errorf("req_id is empty")
@@ -630,10 +633,13 @@ func (c *WSClient) Reply(frame *WsFrame, body interface{}, cmd string) (*WsFrame
 
 // HasPendingReplyAck 检查指定消息帧是否有未完成的 ack
 //
-// 只反映已发出、正在等待回执的回复，不包括仍在排队的回复。frame 不能为 nil。
+// 只反映已发出、正在等待回执的回复，不包括仍在排队的回复。frame 为 nil 时返回 false。
 //
 // 用于流式场景：调用方可据此决定是否跳过当前中间帧，避免排队积压。
 func (c *WSClient) HasPendingReplyAck(frame *WsFrame) bool {
+	if frame == nil {
+		return false
+	}
 	reqID := frame.Headers.ReqID
 	return c.wsManager.hasPendingAck(reqID)
 }
@@ -847,8 +853,11 @@ func (c *WSClient) SendTemplateCard(chatID string, templateCard TemplateCard) (*
 // 通过 WebSocket 长连接执行分片上传：init → chunk × N → finish
 // 单个分片不超过 512KB（Base64 编码前），最多 100 个分片。
 //
-// fileBuffer 超过 100 个分片时直接返回错误。各步骤串行执行、逐条等待回执，耗时随分片数增长；任一步失败即返回包装后的错误（%w），已上传的分片不会被清理。成功时返回的 MediaID 可传给 ReplyMedia 或 SendMediaMessage。需要已建立的连接，不要在消息回调中同步调用。
+// fileBuffer 为空或超过 100 个分片时直接返回错误。各步骤串行执行、逐条等待回执，耗时随分片数增长；任一步失败即返回包装后的错误（%w），已上传的分片不会被清理。成功时返回的 MediaID 可传给 ReplyMedia 或 SendMediaMessage。需要已建立的连接，不能在 OnAuthenticated 中同步调用（在 OnMessage*/OnEvent* 中进行耗时上传建议放到新协程中以免阻塞后续帧分发）。
 func (c *WSClient) UploadMedia(fileBuffer []byte, options UploadMediaOptions) (*UploadMediaFinishResult, error) {
+	if len(fileBuffer) == 0 {
+		return nil, fmt.Errorf("fileBuffer must not be empty")
+	}
 	totalSize := len(fileBuffer)
 
 	// 分片大小：512KB（Base64 编码前）
@@ -1082,13 +1091,8 @@ func GetEventType(frame *WsFrame) string {
 		return ""
 	}
 
-	eventRaw, ok := bodyMap["event"]
-	if !ok {
-		return ""
-	}
-
-	eventMap, ok := eventRaw.(map[string]interface{})
-	if !ok {
+	eventMap, err := extractEventMap(bodyMap)
+	if err != nil {
 		return ""
 	}
 

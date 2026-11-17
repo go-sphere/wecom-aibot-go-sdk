@@ -2,6 +2,8 @@ package aibot
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 )
 
 // ============================================================================
@@ -56,23 +58,16 @@ func (h *MessageHandler) HandleFrame(frame *WsFrame, emitter FrameEmitter) {
 
 	// 事件推送回调处理
 	if frame.Cmd == WsCmd.EVENT_CALLBACK {
-		h.handleEventCallback(frame, emitter)
+		h.handleEventCallback(frame, bodyMap, emitter)
 		return
 	}
 
 	// 消息推送回调处理
-	h.handleMessageCallback(frame, emitter)
+	h.handleMessageCallback(frame, bodyMap, emitter)
 }
 
 // handleMessageCallback 处理消息推送回调
-func (h *MessageHandler) handleMessageCallback(frame *WsFrame, emitter FrameEmitter) {
-	// 解析 body 获取具体消息类型
-	var bodyMap map[string]interface{}
-	if err := json.Unmarshal(frame.Body, &bodyMap); err != nil {
-		h.logger.Error("Failed to parse message body: %s", err.Error())
-		return
-	}
-
+func (h *MessageHandler) handleMessageCallback(frame *WsFrame, bodyMap map[string]interface{}, emitter FrameEmitter) {
 	msgtype, _ := bodyMap["msgtype"].(string)
 
 	// 触发通用消息事件
@@ -98,33 +93,10 @@ func (h *MessageHandler) handleMessageCallback(frame *WsFrame, emitter FrameEmit
 }
 
 // handleEventCallback 处理事件推送回调
-func (h *MessageHandler) handleEventCallback(frame *WsFrame, emitter FrameEmitter) {
-	// 解析 body
-	var bodyMap map[string]interface{}
-	if err := json.Unmarshal(frame.Body, &bodyMap); err != nil {
-		h.logger.Error("Failed to parse event body: %s", err.Error())
-		return
-	}
-
-	// 获取 event 字段
-	eventRaw, ok := bodyMap["event"]
-	if !ok {
-		h.logger.Debug("Received event callback without event field")
-		return
-	}
-
-	// event 可能是 map[string]interface{} 或 json.RawMessage
-	var eventMap map[string]interface{}
-	switch v := eventRaw.(type) {
-	case map[string]interface{}:
-		eventMap = v
-	case string:
-		if err := json.Unmarshal([]byte(v), &eventMap); err != nil {
-			h.logger.Error("Failed to parse event JSON: %s", err.Error())
-			return
-		}
-	default:
-		h.logger.Debug("Received event callback with invalid event format")
+func (h *MessageHandler) handleEventCallback(frame *WsFrame, bodyMap map[string]interface{}, emitter FrameEmitter) {
+	eventMap, err := extractEventMap(bodyMap)
+	if err != nil {
+		h.logger.Debug("Received event callback without valid event: %s", err.Error())
 		return
 	}
 
@@ -156,6 +128,37 @@ func (h *MessageHandler) handleEventCallback(frame *WsFrame, emitter FrameEmitte
 		emitter.EmitEventDisconnected(frame)
 	default:
 		h.logger.Debug("Received unhandled event type: %s", eventType)
+	}
+}
+
+// extractEventMap 从已解析的回调 body 中提取 event 对象（兼容对象和 JSON 字符串两种编码形式）。
+func extractEventMap(bodyMap map[string]interface{}) (map[string]interface{}, error) {
+	if bodyMap == nil {
+		return nil, errors.New("body is nil")
+	}
+
+	eventRaw, ok := bodyMap["event"]
+	if !ok {
+		return nil, errors.New("missing event field")
+	}
+
+	switch v := eventRaw.(type) {
+	case map[string]interface{}:
+		if v == nil {
+			return nil, errors.New("invalid event format")
+		}
+		return v, nil
+	case string:
+		var eventMap map[string]interface{}
+		if err := json.Unmarshal([]byte(v), &eventMap); err != nil {
+			return nil, fmt.Errorf("failed to parse event JSON: %w", err)
+		}
+		if eventMap == nil {
+			return nil, errors.New("invalid event format")
+		}
+		return eventMap, nil
+	default:
+		return nil, errors.New("invalid event format")
 	}
 }
 

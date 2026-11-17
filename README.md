@@ -10,7 +10,7 @@
 - **自动认证** — 连接建立后自动发送认证帧（botId + secret）
 - **心跳保活** — 自动维护心跳，连续未收到 ack 时自动判定连接异常
 - **断线重连** — 指数退避重连策略（1s → 2s → 4s → ... → 30s 上限），支持自定义最大重连次数
-- **消息分发** — 自动解析消息类型并触发对应事件（text / image / mixed / voice / file）
+- **消息分发** — 自动解析消息类型并触发对应事件（text / image / mixed / voice / file / video）
 - **流式回复** — 内置流式回复方法，支持 Markdown 和图文混排
 - **模板卡片** — 支持回复模板卡片消息、流式+卡片组合回复、更新卡片
 - **主动推送** — 支持向指定会话主动发送 Markdown 或模板卡片消息，无需依赖回调帧
@@ -82,7 +82,7 @@ func main() {
 
 		fmt.Printf("收到文本: %s\n", msg.Text.Content)
 
-		streamID := fmt.Sprintf("stream_%d", frame.Headers.ReqID)
+		streamID := fmt.Sprintf("stream_%s", frame.Headers.ReqID)
 		reply := "你好！你说的是: " + msg.Text.Content
 
 		// 发送流式回复
@@ -112,11 +112,15 @@ func main() {
 | --- | --- | --- | --- | --- |
 | `BotID` | `string` | ✅ | — | 机器人 ID（企业微信后台获取） |
 | `Secret` | `string` | ✅ | — | 机器人 Secret（企业微信后台获取） |
+| `Scene` | `*int` | — | `nil` | 场景值（可选），非 `nil` 时随认证帧发送 |
+| `PlugVersion` | `string` | — | `""` | 插件版本号（可选），非空时随认证帧发送 |
 | `ReconnectInterval` | `int` | — | `1000` | 重连基础延迟（毫秒），实际延迟按指数退避递增（1s → 2s → 4s → ... → 30s 上限） |
 | `MaxReconnectAttempts` | `int` | — | `10` | 最大重连次数（`-1` 表示无限重连） |
+| `MaxAuthFailureAttempts` | `int` | — | `5` | 认证失败时的最大重试次数（`-1` 表示无限重试） |
 | `HeartbeatInterval` | `int` | — | `30000` | 心跳间隔（毫秒） |
 | `RequestTimeout` | `int` | — | `10000` | HTTP 请求超时时间（毫秒） |
 | `ReplyAckTimeout` | `int` | — | `5000` | 回复回执超时（毫秒），适用于 `Reply*` 与 `UploadMedia` 等所有等待回执的发送 |
+| `MaxReplyQueueSize` | `int` | — | `500` | 单个 `req_id` 的回复队列最大长度，超出时新回复直接返回错误 |
 | `WSURL` | `string` | — | `wss://openws.work.weixin.qq.com` | 自定义 WebSocket 连接地址 |
 | `WsDialer` | `*websocket.Dialer` | — | `nil` | 自定义 WebSocket Dialer（如 TLS 配置等） |
 | `Logger` | `Logger` | — | `DefaultLogger` | 自定义日志实例 |
@@ -151,7 +155,11 @@ client := aibot.NewWSClient(options aibot.WSClientOptions)
 | `SendMessage(chatID, body)` | 主动发送消息（支持 Markdown 或模板卡片），无需依赖回调帧 | `(*WsFrame, error)` |
 | `SendMarkdown(chatID, content)` | 主动发送 Markdown 消息 | `(*WsFrame, error)` |
 | `SendTemplateCard(chatID, templateCard)` | 主动发送模板卡片消息 | `(*WsFrame, error)` |
+| `UploadMedia(fileBuffer, options)` | 分片上传临时素材（init → chunk × N → finish） | `(*UploadMediaFinishResult, error)` |
+| `ReplyMedia(frame, mediaType, mediaID, videoOptions)` | 被动回复媒体消息（file / image / voice / video） | `(*WsFrame, error)` |
+| `SendMediaMessage(chatID, mediaType, mediaID, videoOptions)` | 主动发送媒体消息（file / image / voice / video） | `(*WsFrame, error)` |
 | `DownloadFile(fileURL, aesKey)` | 下载文件并使用 AES 密钥解密，返回文件内容和文件名 | `([]byte, string, error)` |
+| `GetAPI()` | 获取内部 HTTP API 客户端实例 | `*WeComApiClient` |
 
 ### ReplyStream 详细说明
 
@@ -255,6 +263,7 @@ SDK 支持以下消息类型（`MessageType` 常量）：
 | `MessageTypeMixed` | `"mixed"` | 图文混排消息（包含 text / image 子项） |
 | `MessageTypeVoice` | `"voice"` | 语音消息（已转文本） |
 | `MessageTypeFile` | `"file"` | 文件消息（URL 已加密，使用消息中的 `File.AesKey` 解密） |
+| `MessageTypeVideo` | `"video"` | 视频消息（URL 已加密，使用消息中的 `Video.AesKey` 解密） |
 
 SDK 支持以下事件类型（`EventType` 常量）：
 
@@ -263,6 +272,7 @@ SDK 支持以下事件类型（`EventType` 常量）：
 | `EventTypeEnterChat` | `"enter_chat"` | 进入会话事件：用户当天首次进入机器人单聊会话 |
 | `EventTypeTemplateCardEvent` | `"template_card_event"` | 模板卡片事件：用户点击模板卡片按钮 |
 | `EventTypeFeedbackEvent` | `"feedback_event"` | 用户反馈事件：用户对机器人回复进行反馈 |
+| `EventTypeDisconnected` | `"disconnected_event"` | 连接断开事件：有新连接建立，服务端主动断开当前旧连接 |
 
 ### 消息帧结构（`WsFrame`）
 
@@ -320,6 +330,10 @@ client := aibot.NewWSClient(aibot.WSClientOptions{
 | `GetEventType(frame)` | 从 frame 中提取 eventtype |
 | `ParseMessageBody(frame, v)` | 解析消息体为指定类型 |
 | `GenerateReqId(cmd)` | 生成请求 ID |
+| `GenerateRandomString(length)` | 生成指定长度的随机十六进制字符串 |
+| `GetFilenameFromURL(rawURL)` | 从下载 URL 中提取并解码文件名 |
+| `GetMimeType(filename)` | 根据文件扩展名获取 MIME 类型 |
+| `DecryptFile(encryptedData, aesKey)` | 使用 AES-256-CBC 解密下载的加密文件 |
 | `CreateTextReplyBody(content)` | 创建文本回复消息体 |
 | `CreateMarkdownReplyBody(content)` | 创建 Markdown 回复消息体 |
 | `CreateWelcomeReplyBody(content)` | 创建欢迎语回复消息体 |
@@ -357,7 +371,8 @@ SDK 内置了独立的企业微信消息加解密模块，支持 AES-256-CBC 加
 
 ```go
 import (
-	"errors"
+	"fmt"
+
 	aibot "github.com/go-sphere/wecom-aibot-go-sdk/aibot"
 )
 
@@ -399,17 +414,22 @@ fmt.Println(decrypted) // {"hello":"world"}
 ```
 wecom-aibot-go-sdk/
 ├── aibot/
-│   ├── client.go           # WSClient 核心客户端
-│   ├── ws.go               # WebSocket 长连接管理器
-│   ├── message_handler.go  # 消息解析与事件分发
 │   ├── api.go              # HTTP API 客户端（文件下载）
+│   ├── client.go           # WSClient 核心客户端
 │   ├── crypto.go           # AES-256-CBC 文件解密
+│   ├── dispatch.go         # 生命周期隔离的回调分发队列
+│   ├── doc.go              # 包级别文档
 │   ├── logger.go           # 日志接口与默认实现
-│   ├── utils.go            # 工具方法
+│   ├── message_handler.go  # 消息解析与事件分发
 │   ├── types.go            # 类型定义
-│   └── crypto.go           # AES 文件解密
+│   ├── utils.go            # 工具方法
+│   ├── wecom_crypto.go     # 回调签名校验与加解密（WecomCrypto）
+│   └── ws.go               # WebSocket 长连接管理器
 ├── examples/
-│   └── basic/main.go       # 基础使用示例
+│   ├── basic/              # 基础使用示例（独立 Go 模块）
+│   └── agent/              # AI Agent 工具调用示例（独立 Go 模块）
+├── CHANGELOG.md
+├── Makefile
 ├── go.mod
 └── README.md
 ```
@@ -421,8 +441,10 @@ wecom-aibot-go-sdk/
 git clone https://github.com/go-sphere/wecom-aibot-go-sdk.git
 cd wecom-aibot-go-sdk
 
-# 运行示例
-WECOM_BOT_ID=your-bot-id WECOM_BOT_SECRET=your-bot-secret go run examples/basic/main.go
+# 运行基础示例（在示例模块目录中配置 config.json）
+cd examples/basic
+cp config.example.json config.json
+go run .
 ```
 
 ## License

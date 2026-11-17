@@ -27,8 +27,14 @@ func GenerateReqId(cmd string) string {
 
 // generateRandomString 生成随机字符串
 func generateRandomString(length int) string {
-	bytes := make([]byte, length)
-	rand.Read(bytes)
+	if length < 0 {
+		panic("generateRandomString: negative length")
+	}
+	if length == 0 {
+		return ""
+	}
+	bytes := make([]byte, (length+1)/2)
+	_, _ = rand.Read(bytes)
 	return hex.EncodeToString(bytes)[:length]
 }
 

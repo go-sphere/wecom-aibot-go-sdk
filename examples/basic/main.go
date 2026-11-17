@@ -213,18 +213,7 @@ func main() {
 			fmt.Println("下载图片失败:", err.Error())
 			return
 		}
-
-		if filename == "" {
-			filename = "image.jpg"
-		}
-		tmpDir, _ := os.MkdirTemp("", "wecom-")
-		// filename comes from the download response; keep only its base name.
-		tmpPath := filepath.Join(tmpDir, filepath.Base(filename))
-		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-			fmt.Println("保存文件失败:", err.Error())
-		} else {
-			fmt.Printf("图片已保存: %s (%d bytes)\n", tmpPath, len(data))
-		}
+		saveDownloadedFile("图片", filename, "image.jpg", data)
 	}))
 
 	// 视频消息
@@ -241,18 +230,7 @@ func main() {
 			fmt.Println("下载视频失败:", err.Error())
 			return
 		}
-
-		if filename == "" {
-			filename = "video.mp4"
-		}
-		tmpDir, _ := os.MkdirTemp("", "wecom-")
-		// filename comes from the download response; keep only its base name.
-		tmpPath := filepath.Join(tmpDir, filepath.Base(filename))
-		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-			fmt.Println("保存文件失败:", err.Error())
-		} else {
-			fmt.Printf("视频已保存: %s (%d bytes)\n", tmpPath, len(data))
-		}
+		saveDownloadedFile("视频", filename, "video.mp4", data)
 	}))
 
 	// 文件消息
@@ -269,18 +247,7 @@ func main() {
 			fmt.Println("下载文件失败:", err.Error())
 			return
 		}
-
-		if filename == "" {
-			filename = "file.dat"
-		}
-		tmpDir, _ := os.MkdirTemp("", "wecom-")
-		// filename comes from the download response; keep only its base name.
-		tmpPath := filepath.Join(tmpDir, filepath.Base(filename))
-		if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-			fmt.Println("保存文件失败:", err.Error())
-		} else {
-			fmt.Printf("文件已保存: %s (%d bytes)\n", tmpPath, len(data))
-		}
+		saveDownloadedFile("文件", filename, "file.dat", data)
 	}))
 
 	// 事件处理
@@ -331,4 +298,34 @@ func main() {
 // do not delay dispatch of later frames; replies awaited inline work either way.
 func async(h func(frame *aibot.WsFrame)) func(frame *aibot.WsFrame) {
 	return func(frame *aibot.WsFrame) { go h(frame) }
+}
+
+func resolveDownloadFilename(filename, defaultFilename string) (string, error) {
+	if filename == "" {
+		return defaultFilename, nil
+	}
+	base := filepath.Base(filename)
+	if base == "." || base == ".." || base == string(filepath.Separator) {
+		return "", fmt.Errorf("非法文件名: %q", filename)
+	}
+	return base, nil
+}
+
+func saveDownloadedFile(kind, filename, defaultFilename string, data []byte) {
+	safeName, err := resolveDownloadFilename(filename, defaultFilename)
+	if err != nil {
+		fmt.Println("保存文件失败:", err.Error())
+		return
+	}
+	tmpDir, err := os.MkdirTemp("", "wecom-")
+	if err != nil {
+		fmt.Println("创建临时目录失败:", err.Error())
+		return
+	}
+	tmpPath := filepath.Join(tmpDir, safeName)
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		fmt.Println("保存文件失败:", err.Error())
+		return
+	}
+	fmt.Printf("%s已保存: %s (%d bytes)\n", kind, tmpPath, len(data))
 }
