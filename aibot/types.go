@@ -212,18 +212,24 @@ type VideoMessage struct {
 }
 
 // ReplyOptions 回复消息选项（WSClient 的方法不使用此类型）
+//
+// Deprecated: Unused by [WSClient]; pass message parameters directly to Reply or SendMessage instead.
 type ReplyOptions struct {
 	MsgID  string `json:"msgid"`
 	ChatID string `json:"chatid"`
 }
 
 // SendTextParams 发送文本消息参数
+//
+// Deprecated: Unused by [WSClient]; use ReplyText or SendMarkdown instead.
 type SendTextParams struct {
 	ReplyOptions
 	Content string `json:"content"`
 }
 
 // SendMarkdownParams 发送 Markdown 消息参数
+//
+// Deprecated: Unused by [WSClient]; use ReplyMarkdown or SendMarkdown instead.
 type SendMarkdownParams struct {
 	ReplyOptions
 	Content string `json:"content"`
