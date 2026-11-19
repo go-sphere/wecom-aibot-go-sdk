@@ -4,6 +4,8 @@ This file starts after `v1.0.5`.
 
 ## Unreleased
 
+## v1.0.6 (2026-11-19)
+
 ### Added
 
 - `WSClientOptions.ReplyAckTimeout` and `WsConnectionManager.SetReplyAckTimeout` to configure the reply acknowledgement timeout (default `5000` ms).
